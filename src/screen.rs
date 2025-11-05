@@ -136,6 +136,32 @@ impl Screen {
         self.grid().dropped_off_scrollback_lines()
     }
 
+    /// Returns a row in the history by global index.
+    /// The zero index is the first used scrollback line
+    /// The last index is the last screen row (even when not written to yet)
+    /// The returned value is a plain text string wihtout formatting information.
+    #[must_use]
+    pub fn row_by_global_index(&self, index: usize) -> String {
+        let row = self.grid().row_by_global_index(index);
+        let mut contents = String::new();
+        row.write_contents(&mut contents, 0, self.size().1, false);
+        contents
+    }
+
+    /// Returns a row in the history by global index.
+    /// The zero index is the first used scrollback line
+    /// The last index is the last screen row (even when not written to yet)
+    /// The returned value is a vector of bytes with ANSI codes that can be
+    /// directly written to a terminal.
+    #[must_use]
+    pub fn row_by_global_index_formatted(&self, index: usize) -> Vec<u8> {
+        let row = self.grid().row_by_global_index(index);
+        let mut contents = vec![];
+        row.write_contents_formatted(
+            &mut contents, 0, self.size().1, 0, false, None, None);
+        contents
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

@@ -115,6 +115,17 @@ impl Grid {
         self.col_clamp();
     }
 
+    /// Returns a line in the history by global index.
+    /// The zero index is the first used scrollback line
+    /// The last index is the last screen row (even when not written to yet)
+    pub fn row_by_global_index(&self, index: usize) -> &crate::row::Row {
+        if index < self.used_scrollback_lines() {
+            &self.scrollback[index]
+        } else {
+            &self.rows[index - self.used_scrollback_lines()]
+        }
+    }
+
     pub fn save_cursor(&mut self) {
         self.saved_pos = self.pos;
         self.saved_origin_mode = self.origin_mode;
