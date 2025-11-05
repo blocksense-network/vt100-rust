@@ -123,6 +123,19 @@ impl Screen {
         self.grid().scrollback()
     }
 
+    /// Returns the number of lines in the scrollback that are currently in use.
+    #[must_use]
+    pub fn used_scrollback_lines(&self) -> usize {
+        self.grid().used_scrollback_lines()
+    }
+
+    /// Returns the number of lines that have been dropped off from the preserved
+    /// scrollback history and are no longer accessible.
+    #[must_use]
+    pub fn dropped_off_scrollback_lines(&self) -> usize {
+        self.grid().dropped_off_scrollback_lines()
+    }
+
     /// Returns the text contents of the terminal.
     ///
     /// This will not include any formatting information, and will be in plain

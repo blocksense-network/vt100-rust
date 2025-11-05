@@ -13,6 +13,7 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    dropped_off_scrollback_lines: usize,
 }
 
 impl Grid {
@@ -29,6 +30,7 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            dropped_off_scrollback_lines: 0,
         }
     }
 
@@ -193,6 +195,14 @@ impl Grid {
 
     pub fn scrollback(&self) -> usize {
         self.scrollback_offset
+    }
+
+    pub fn used_scrollback_lines(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn dropped_off_scrollback_lines(&self) -> usize {
+        self.dropped_off_scrollback_lines
     }
 
     pub fn set_scrollback(&mut self, rows: usize) {
@@ -567,6 +577,7 @@ impl Grid {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
+                    self.dropped_off_scrollback_lines += 1;
                 }
                 if self.scrollback_offset > 0 {
                     self.scrollback_offset =
