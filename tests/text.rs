@@ -400,3 +400,45 @@ fn an_emoji_cluster_does_not_join_the_row_above() {
     );
     assert_eq!(parser.screen().cursor_position(), (1, 3));
 }
+
+// A screen one row high scrolls that row away when a character wraps past
+// its last column, as a taller screen scrolls its top row away at the
+// bottom: the row the character wrapped from leaves the screen, and the
+// character is printed in the first column of the new row. tmux 3.6a does
+// the same in a pane one row high. The row that left is kept in the
+// scrollback, marked as wrapped, when the screen has one.
+#[test]
+fn a_one_row_screen_wraps() {
+    let mut parser = vt100::Parser::new(1, 10, 0);
+    parser.process(b"abcdefghijKL");
+    assert_eq!(parser.screen().contents(), "KL");
+    assert_eq!(parser.screen().cursor_position(), (0, 2));
+
+    // a wide character that does not fit in the last column wraps too
+    let mut parser = vt100::Parser::new(1, 10, 0);
+    parser.process("abcdefghi\u{4e2d}".as_bytes());
+    assert_eq!(parser.screen().contents(), "\u{4e2d}");
+    assert_eq!(parser.screen().cursor_position(), (0, 2));
+
+    let mut parser = vt100::Parser::new(1, 10, 10);
+    parser.process(b"abcdefghijKLMNOPQRSTuv");
+    assert_eq!(parser.screen().contents(), "uv");
+    assert!(!parser.screen().row_wrapped(0));
+    parser.screen_mut().set_scrollback(1);
+    assert_eq!(parser.screen().contents(), "KLMNOPQRST");
+    assert!(parser.screen().row_wrapped(0));
+    parser.screen_mut().set_scrollback(2);
+    assert_eq!(parser.screen().contents(), "abcdefghij");
+    assert!(parser.screen().row_wrapped(0));
+
+    // a wide character that does not fit after an empty last column moves
+    // to the next row without wrapping the row it left (text() only wraps
+    // after a last column with contents): the row in the scrollback is not
+    // marked as wrapped
+    let mut parser = vt100::Parser::new(1, 10, 10);
+    parser.process("abcdefghi\u{4e2d}".as_bytes());
+    assert_eq!(parser.screen().contents(), "\u{4e2d}");
+    parser.screen_mut().set_scrollback(1);
+    assert_eq!(parser.screen().contents(), "abcdefghi");
+    assert!(!parser.screen().row_wrapped(0));
+}

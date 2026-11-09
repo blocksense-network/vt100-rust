@@ -702,14 +702,25 @@ impl Grid {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
             let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            if let Some(row) = prev_pos.row.checked_sub(scrolled) {
+                prev_pos.row = row;
+                self.drawing_row_mut(prev_pos.row)
+                    // we assume self.pos.row is always valid, and so
+                    // prev_pos.row must be valid because it is always less
+                    // than or equal to self.pos.row
+                    .unwrap()
+                    .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            } else if self.scrollback_len > 0 && !self.scroll_region_active()
+            {
+                // the row the cursor wrapped from scrolled off the screen,
+                // which only happens on a screen one row high (a scroll
+                // region has at least two rows): scroll_up pushed it to
+                // the scrollback, as the last row there.
+                if let Some(row) = self.scrollback.back_mut() {
+                    row.wrap(wrap);
+                }
+            }
         }
     }
 
