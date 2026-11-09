@@ -1122,6 +1122,26 @@ impl Screen {
         self.clear_mode(MODE_APPLICATION_KEYPAD);
     }
 
+    // ESC D
+    //
+    // Down one row, scrolling at the bottom margin, as LF does (the parser
+    // has no LNM mode that would make LF differ). Like LF, and as in tmux,
+    // it keeps a pending wrap: after a character in the last column the
+    // next character wraps one row further
+    // (https://invisible-island.net/xterm/ctlseqs/ctlseqs.html, IND).
+    pub(crate) fn ind(&mut self) {
+        self.lf();
+    }
+
+    // ESC E
+    //
+    // A carriage return and an IND; the carriage return ends a pending wrap
+    // (https://invisible-island.net/xterm/ctlseqs/ctlseqs.html, NEL).
+    pub(crate) fn nel(&mut self) {
+        self.cr();
+        self.ind();
+    }
+
     // ESC M
     pub(crate) fn ri(&mut self) {
         self.grid_mut().row_dec_scroll(1);
