@@ -62,6 +62,13 @@ fn continuation() -> (String, bool) {
     ("<wide>".to_string(), false)
 }
 
+/// Whether `bytes` restore a saved cursor (DECRC, `ESC 8`). tmux 3.6a
+/// restores a cursor saved past the end of a row into the row's last column,
+/// so the next character is printed over that cell instead of wrapping.
+fn restores_a_saved_cursor(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|w| w == b"\x1b8")
+}
+
 // VARIATION SELECTOR-16 (U+FE0F) asks for the emoji presentation of the
 // character before it, and an emoji base with it is two columns wide, as
 // unicode-width counts it (https://www.unicode.org/reports/tr51/#Presentation_Style)
@@ -441,4 +448,249 @@ fn a_one_row_screen_wraps() {
     parser.screen_mut().set_scrollback(1);
     assert_eq!(parser.screen().contents(), "abcdefghi");
     assert!(!parser.screen().row_wrapped(0));
+}
+
+// THUMBS UP SIGN, then EMOJI MODIFIER FITZPATRICK TYPE-4 and REGIONAL
+// INDICATOR SYMBOL LETTER B: each joins the cell before the cursor when it is
+// printed right after it.
+const THUMBS_UP: &str = "\u{1f44d}";
+const SKIN_TONE: &str = "\u{1f3fd}";
+const RI_B: &str = "\u{1f1e7}";
+
+// Two cells that would join keep their own cells when the program writes
+// them apart (the join depends only on where the cursor is, as in tmux), and
+// the formatted contents (contents_formatted, rows_formatted, contents_diff
+// and state_diff) rebuild that screen: replayed, the second cell is not
+// printed right after the first. tmux 3.6a keeps each of these screens
+// apart, in a detached pane written with `stty -opost`: the modifier written
+// before its base gives `👍🏽Z` with Z in column 4, where written in order the
+// two join and Z stays in column 4 after two blank columns.
+#[test]
+fn emoji_cells_written_apart_are_replayed_apart() {
+    // The modifier first, then its base before it.
+    let input = format!("\x1b[1;3H{SKIN_TONE}\x1b[1;1H{THUMBS_UP}\x1b[1;5HZ");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 5),
+        [
+            wide_cell(THUMBS_UP),
+            continuation(),
+            wide_cell(SKIN_TONE),
+            continuation(),
+            narrow_cell("Z")
+        ]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+
+    // A cell ending in a ZWJ (HEAVY BLACK HEART, VS16, ZWJ), with FIRE
+    // written after it beforehand.
+    let input =
+        "\x1b[1;3H\u{1f525}\x1b[1;1H\u{2764}\u{fe0f}\u{200d}\x1b[1;5HZ";
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 5),
+        [
+            wide_cell("\u{2764}\u{fe0f}\u{200d}"),
+            continuation(),
+            wide_cell("\u{1f525}"),
+            continuation(),
+            narrow_cell("Z")
+        ]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+
+    // Three regional indicators written right to left: each would join the
+    // one before it into a flag. tmux 3.6a gives `🇧🇬🇧Z`, Z in column 3.
+    let input =
+        format!("\x1b[1;3H{RI_B}\x1b[1;2H\u{1f1ec}\x1b[1;1H{RI_B}\x1b[1;4HZ");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 4),
+        [
+            narrow_cell(RI_B),
+            narrow_cell("\u{1f1ec}"),
+            narrow_cell(RI_B),
+            narrow_cell("Z")
+        ]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+
+    // The pair in the last two cells of a row that did not wrap.
+    let input =
+        format!("\x1b[1;79H{SKIN_TONE}\x1b[1;77H{THUMBS_UP}\x1b[2;1HZ");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 80)[76..],
+        [
+            wide_cell(THUMBS_UP),
+            continuation(),
+            wide_cell(SKIN_TONE),
+            continuation()
+        ]
+    );
+    assert!(!parser.screen().row_wrapped(0));
+    helpers::assert_reproduces_state(input.as_bytes());
+}
+
+// The same across the end of a wrapped row. A character printed in the
+// first column of a row the row above wrapped onto, after the cursor was
+// moved there, does not join the last cell of the row above, as in tmux
+// 3.6a (80x24: `a`×78 and 👍 on the row, then `x` wraps, a carriage return
+// and the modifier give 🏽 in column 0 of the next row and Z in column 2).
+// A replay prints that character right after the row above, with the cursor
+// waiting to wrap, so it must not be joined there either.
+#[test]
+fn an_emoji_cell_written_apart_across_a_wrapped_row_is_replayed_apart() {
+    let input =
+        format!("\x1b[2;1H{}{THUMBS_UP}x\r{SKIN_TONE}Z", "a".repeat(78));
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert!(parser.screen().row_wrapped(1));
+    assert_eq!(
+        cells(&parser, 1, 80)[78..],
+        [wide_cell(THUMBS_UP), continuation()]
+    );
+    assert_eq!(
+        cells(&parser, 2, 3),
+        [wide_cell(SKIN_TONE), continuation(), narrow_cell("Z")]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+}
+
+// A pair written apart in the last cells of a wrapped row: the replay prints
+// the row's last cell last, so the cursor waits to wrap after it and the next
+// row's first character wraps the row, as in the screen it came from. tmux
+// 3.6a keeps the cells apart (80x24: 👍 in columns 76-77, 🏽 in 78-79, the
+// row wrapped onto `x`); so it does for three regional indicators.
+#[test]
+fn emoji_cells_written_apart_at_the_end_of_a_wrapped_row_are_replayed_apart()
+{
+    let input =
+        format!("\x1b[2;79H{SKIN_TONE}x\x1b[2;77H{THUMBS_UP}\x1b[2;1HZ");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert!(parser.screen().row_wrapped(1));
+    assert_eq!(
+        cells(&parser, 1, 80)[76..],
+        [
+            wide_cell(THUMBS_UP),
+            continuation(),
+            wide_cell(SKIN_TONE),
+            continuation()
+        ]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+    // the row's other cells are printed after the rows below, not between a
+    // saved and a restored cursor
+    assert!(!restores_a_saved_cursor(
+        &parser.screen().contents_formatted()
+    ));
+    assert!(!restores_a_saved_cursor(
+        &parser
+            .screen()
+            .contents_diff(vt100::Parser::default().screen())
+    ));
+
+    let input = format!(
+        "\x1b[2;80H{RI_B}x\x1b[2;79H{RI_B}\x1b[2;78H{RI_B}\x1b[2;1HZ"
+    );
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert!(parser.screen().row_wrapped(1));
+    assert_eq!(
+        cells(&parser, 1, 80)[77..],
+        [narrow_cell(RI_B), narrow_cell(RI_B), narrow_cell(RI_B)]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+    assert!(!restores_a_saved_cursor(
+        &parser.screen().contents_formatted()
+    ));
+
+    // The row wraps only in the new screen, with the pair apart and
+    // unchanged in both: contents_diff draws the row's last cell again to
+    // wrap it. (The new screen erases the base first, so that the modifier
+    // written after it does not join it.)
+    helpers::assert_reproduces_state_from(
+        format!(
+            "\x1b[2;77H\x1b[2X\x1b[2;79H{SKIN_TONE}x\x1b[2;77H{THUMBS_UP}\x1b[2;1HZ"
+        )
+        .as_bytes(),
+        format!("\x1b[2;79H{SKIN_TONE}\x1b[2;77H{THUMBS_UP}").as_bytes(),
+    );
+}
+
+// With the cursor waiting to wrap after a pair written apart in the last
+// cells of its row (LF keeps it waiting, as in tmux 3.6a, whose cursor ends
+// at column 80 of row 1 on this input), the replay leaves the cursor waiting
+// there too, and the cells apart. It gets there as the program did, from the
+// last cell of a row above and a line feed; with no such row above, by
+// saving and restoring the cursor, which this parser restores past the end.
+#[test]
+fn the_cursor_waits_to_wrap_after_emoji_cells_written_apart() {
+    let input =
+        format!("\x1b[2;79H{SKIN_TONE}\x1b[2;77H{THUMBS_UP}\x1b[1;80HQ\n");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(parser.screen().cursor_position(), (1, 80));
+    assert_eq!(
+        cells(&parser, 1, 80)[76..],
+        [
+            wide_cell(THUMBS_UP),
+            continuation(),
+            wide_cell(SKIN_TONE),
+            continuation()
+        ]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+    assert!(!restores_a_saved_cursor(&parser.screen().state_formatted()));
+    assert!(!restores_a_saved_cursor(
+        &parser.screen().cursor_state_formatted()
+    ));
+
+    // The same on the bottom row, whose run is printed after the rows too.
+    let input =
+        format!("\x1b[24;79H{SKIN_TONE}\x1b[24;77H{THUMBS_UP}\x1b[23;80HQ\n");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(parser.screen().cursor_position(), (23, 80));
+    helpers::assert_reproduces_state(input.as_bytes());
+    assert!(!restores_a_saved_cursor(&parser.screen().state_formatted()));
+    assert!(!restores_a_saved_cursor(
+        &parser
+            .screen()
+            .state_diff(vt100::Parser::default().screen())
+    ));
+
+    // The pair on the first row: VPA keeps the cursor waiting to wrap.
+    let input = format!(
+        "\x1b[1;79H{SKIN_TONE}\x1b[1;77H{THUMBS_UP}\x1b[3;80HQ\x1b[1d"
+    );
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(parser.screen().cursor_position(), (0, 80));
+    helpers::assert_reproduces_state(input.as_bytes());
+}
+
+// contents_diff writes only the cells that changed. When the first cell of
+// a pair written apart is unchanged, the second must still not be printed
+// right after it.
+#[test]
+fn a_diff_keeps_emoji_cells_written_apart_apart() {
+    // 👍 is unchanged; the modifier replaces X after it.
+    helpers::assert_reproduces_state_from(
+        format!("\x1b[1;1H  \x1b[1;3H{SKIN_TONE}\x1b[1;1H{THUMBS_UP}")
+            .as_bytes(),
+        format!("{THUMBS_UP}X").as_bytes(),
+    );
+    // The last cell of a wrapped row and the first cell of the row below
+    // change: the diff prints the second right after the first, with the
+    // cursor waiting to wrap (THUMBS DOWN SIGN replaces THUMBS UP SIGN).
+    helpers::assert_reproduces_state_from(
+        format!("\x1b[2;79H\u{1f44e}\x1b[3;1H{SKIN_TONE}").as_bytes(),
+        format!("\x1b[2;1H{}{THUMBS_UP}x", "a".repeat(78)).as_bytes(),
+    );
 }

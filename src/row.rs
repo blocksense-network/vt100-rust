@@ -134,6 +134,211 @@ impl Row {
         }
     }
 
+    // The column where the cell before `col` on this row starts (the first
+    // half when it is a wide character): the cell a character printed at
+    // `col` follows. None at `start`, the first column written.
+    fn left_cell_start(&self, col: u16, start: u16) -> Option<u16> {
+        if col <= start {
+            return None;
+        }
+        let left = col - 1;
+        if left > start
+            && self.cells[usize::from(left)].is_wide_continuation()
+        {
+            return Some(left - 1);
+        }
+        Some(left)
+    }
+
+    // Whether the cell starting at `col`, printed with the cursor right after
+    // the cell before it, would join that cell's emoji cluster. The parser
+    // joins on the cursor's position alone, as tmux does, so a program can
+    // leave two such cells apart (by writing the second one first, or moving
+    // the cursor between them), and printing them in order would rebuild one
+    // cell where this row has two.
+    pub fn joins_left(&self, col: u16, start: u16) -> bool {
+        self.left_cell_start(col, start).is_some_and(|left| {
+            self.cells[usize::from(col)]
+                .would_join(&self.cells[usize::from(left)])
+        })
+    }
+
+    // Whether this row's first cell would join the last cell of `above`, the
+    // row this one continues, when printed with the cursor waiting to wrap
+    // after that cell: the parser then takes the cell before the cursor on
+    // the row above. A cursor moved to the first column does not join
+    // across the row, so a program can leave the two apart.
+    fn first_cell_joins(&self, above: Option<&Self>) -> bool {
+        let Some(above) = above else {
+            return false;
+        };
+        let last = above.cols() - 1;
+        let last = if last > 0
+            && above.cells[usize::from(last)].is_wide_continuation()
+        {
+            last - 1
+        } else {
+            last
+        };
+        self.cells[0].would_join(&above.cells[usize::from(last)])
+    }
+
+    // Prints the cell starting at `col` with the cursor at `prev_pos`, and
+    // moves `prev_pos` past it.
+    fn write_cell(
+        &self,
+        contents: &mut Vec<u8>,
+        row: u16,
+        col: u16,
+        prev_pos: &mut crate::grid::Pos,
+        prev_attrs: &mut crate::attrs::Attrs,
+    ) {
+        let pos = crate::grid::Pos { row, col };
+        let cell = &self.cells[usize::from(col)];
+        crate::term::MoveFromTo::new(*prev_pos, pos).write_buf(contents);
+        if prev_attrs != cell.attrs() {
+            cell.attrs().write_escape_code_diff(contents, prev_attrs);
+            *prev_attrs = *cell.attrs();
+        }
+        contents.extend(cell.contents().as_bytes());
+        *prev_pos = crate::grid::Pos {
+            row,
+            col: col + if cell.is_wide() { 2 } else { 1 },
+        };
+    }
+
+    /// Prints the cell starting at `col` with the cursor at `prev_pos`, kept
+    /// apart from the cell before it when it would join that cell, and moves
+    /// `prev_pos` and `prev_attrs` to where the cursor and the attributes are
+    /// left. A cell that ends in the last column leaves the cursor waiting to
+    /// wrap after it.
+    pub fn redraw_cell(
+        &self,
+        contents: &mut Vec<u8>,
+        row: u16,
+        col: u16,
+        prev_pos: &mut crate::grid::Pos,
+        prev_attrs: &mut crate::attrs::Attrs,
+    ) {
+        if self.joins_left(col, 0) {
+            self.write_cell_apart(
+                contents, row, col, 0, prev_pos, prev_attrs, None,
+            );
+        } else {
+            self.write_cell(contents, row, col, prev_pos, prev_attrs);
+        }
+    }
+
+    // Prints the cell starting at `col`, which would join the cell before it
+    // (joins_left), so that the two stay apart, as the program left them.
+    // The cell before it may join the one before that in turn, so this takes
+    // the whole run of such cells that ends at `col`: it erases the run's
+    // other cells, prints the cell at `col` (after an erased cell, which it
+    // cannot join), then prints the others again from right to left, each
+    // after an erased cell, and the run's first after a cell it does not
+    // join. Every cell then has its contents and attributes; the erase used
+    // the current attributes, but each erased cell is printed again.
+    //
+    // A cell that ends in the last column leaves the cursor waiting to wrap,
+    // which the next row's first character (it wraps the row) or the final
+    // cursor position may rely on, and only printing a character there
+    // leaves it so. With `deferred` given (the whole grid is being printed),
+    // the run's other cells are left erased and the cell's position is
+    // pushed to it: the caller prints them after the rows below
+    // (write_deferred_run), where moving the cursor no longer matters, and
+    // reaches a final cursor waiting to wrap there on its own
+    // (Grid::write_cursor_position_formatted). Otherwise the cursor is
+    // saved after the cell and restored after the others, which also
+    // restores the attributes the cell was printed with. DECSC and DECRC
+    // keep the column past the end in this parser (as
+    // Grid::write_cursor_position_formatted relies on too), but tmux 3.6a
+    // restores the cursor into the last column, so the next character would
+    // be printed over the cell instead of wrapping; deferring avoids that.
+    // Otherwise the cursor is left after the run's first cell.
+    fn write_cell_apart(
+        &self,
+        contents: &mut Vec<u8>,
+        row: u16,
+        col: u16,
+        start: u16,
+        prev_pos: &mut crate::grid::Pos,
+        prev_attrs: &mut crate::attrs::Attrs,
+        deferred: Option<&mut Vec<crate::grid::Pos>>,
+    ) {
+        let mut first = col;
+        while self.joins_left(first, start) {
+            // joins_left found the cell before `first`
+            first = self.left_cell_start(first, start).unwrap();
+        }
+        let first_pos = crate::grid::Pos { row, col: first };
+        crate::term::MoveFromTo::new(*prev_pos, first_pos)
+            .write_buf(contents);
+        crate::term::EraseChar::new(col - first).write_buf(contents);
+        *prev_pos = first_pos;
+
+        self.write_cell(contents, row, col, prev_pos, prev_attrs);
+        let waits_to_wrap = prev_pos.col >= self.cols();
+        if waits_to_wrap {
+            if let Some(deferred) = deferred {
+                // contents_diff can print the row's last cell twice (again
+                // to wrap the row); its run must be printed once, after an
+                // erased cell each, or the second pass would join it
+                let pos = crate::grid::Pos { row, col };
+                if !deferred.contains(&pos) {
+                    deferred.push(pos);
+                }
+                return;
+            }
+        }
+        let saved = (*prev_pos, *prev_attrs);
+        if waits_to_wrap {
+            crate::term::SaveCursor.write_buf(contents);
+        }
+        self.write_run_before(
+            contents, row, col, start, prev_pos, prev_attrs,
+        );
+        if waits_to_wrap {
+            crate::term::RestoreCursor.write_buf(contents);
+            (*prev_pos, *prev_attrs) = saved;
+        }
+    }
+
+    // Prints the cells of the run that ends at the cell starting at `col`
+    // (see write_cell_apart), other than that cell, from right to left: each
+    // after an erased cell, and the run's first after a cell it does not
+    // join. Leaves the cursor after the run's first cell.
+    fn write_run_before(
+        &self,
+        contents: &mut Vec<u8>,
+        row: u16,
+        col: u16,
+        start: u16,
+        prev_pos: &mut crate::grid::Pos,
+        prev_attrs: &mut crate::attrs::Attrs,
+    ) {
+        let mut next = col;
+        while self.joins_left(next, start) {
+            // joins_left found the cell before `next`
+            next = self.left_cell_start(next, start).unwrap();
+            self.write_cell(contents, row, next, prev_pos, prev_attrs);
+        }
+    }
+
+    /// Prints the cells `write_cell_apart` left erased before the cell at
+    /// `pos` (the last one of its row) and deferred, now that the rows
+    /// below have been printed.
+    pub fn write_deferred_run(
+        &self,
+        contents: &mut Vec<u8>,
+        pos: crate::grid::Pos,
+        prev_pos: &mut crate::grid::Pos,
+        prev_attrs: &mut crate::attrs::Attrs,
+    ) {
+        self.write_run_before(
+            contents, pos.row, pos.col, 0, prev_pos, prev_attrs,
+        );
+    }
+
     pub fn write_contents_formatted(
         &self,
         contents: &mut Vec<u8>,
@@ -141,6 +346,8 @@ impl Row {
         width: u16,
         row: u16,
         wrapping: bool,
+        above: Option<&Self>,
+        mut deferred: Option<&mut Vec<crate::grid::Pos>>,
         prev_pos: Option<crate::grid::Pos>,
         prev_attrs: Option<crate::attrs::Attrs>,
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
@@ -222,7 +429,17 @@ impl Row {
 
             if cell != &default_cell {
                 let attrs = cell.attrs();
-                if cell.has_contents() {
+                if cell.has_contents() && self.joins_left(col, start) {
+                    self.write_cell_apart(
+                        contents,
+                        row,
+                        col,
+                        start,
+                        &mut prev_pos,
+                        &mut prev_attrs,
+                        deferred.as_deref_mut(),
+                    );
+                } else if cell.has_contents() {
                     if pos != prev_pos {
                         if !wrapping
                             || prev_pos.row + 1 != pos.row
@@ -232,6 +449,8 @@ impl Row {
                         {
                             crate::term::MoveFromTo::new(prev_pos, pos)
                                 .write_buf(contents);
+                        } else if self.first_cell_joins(above) {
+                            write_wrap_apart(contents, prev_pos, self.cols());
                         }
                         prev_pos = pos;
                     }
@@ -290,6 +509,8 @@ impl Row {
         row: u16,
         wrapping: bool,
         prev_wrapping: bool,
+        above: Option<&Self>,
+        mut deferred: Option<&mut Vec<crate::grid::Pos>>,
         mut prev_pos: crate::grid::Pos,
         mut prev_attrs: crate::attrs::Attrs,
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
@@ -317,6 +538,9 @@ impl Row {
             } else {
                 false
             };
+            if self.first_cell_joins(above) {
+                write_wrap_apart(contents, prev_pos, self.cols());
+            }
             contents.extend(cell_contents.as_bytes());
             crate::term::Backspace.write_buf(contents);
             if prev_first_cell.is_wide() {
@@ -379,7 +603,17 @@ impl Row {
 
             if cell != prev_cell {
                 let attrs = cell.attrs();
-                if cell.has_contents() {
+                if cell.has_contents() && self.joins_left(col, start) {
+                    self.write_cell_apart(
+                        contents,
+                        row,
+                        col,
+                        start,
+                        &mut prev_pos,
+                        &mut prev_attrs,
+                        deferred.as_deref_mut(),
+                    );
+                } else if cell.has_contents() {
                     if pos != prev_pos {
                         if !wrapping
                             || prev_pos.row + 1 != pos.row
@@ -389,6 +623,8 @@ impl Row {
                         {
                             crate::term::MoveFromTo::new(prev_pos, pos)
                                 .write_buf(contents);
+                        } else if self.first_cell_joins(above) {
+                            write_wrap_apart(contents, prev_pos, self.cols());
                         }
                         prev_pos = pos;
                     }
@@ -458,7 +694,18 @@ impl Row {
                 crate::term::EraseChar::new(1).write_buf(contents);
             }
             let end_cell = &self.cells[usize::from(end_pos.col)];
-            if end_cell.has_contents() {
+            if end_cell.has_contents() && self.joins_left(end_pos.col, start)
+            {
+                self.write_cell_apart(
+                    contents,
+                    row,
+                    end_pos.col,
+                    start,
+                    &mut prev_pos,
+                    &mut prev_attrs,
+                    deferred,
+                );
+            } else if end_cell.has_contents() {
                 let attrs = end_cell.attrs();
                 if &prev_attrs != attrs {
                     attrs.write_escape_code_diff(contents, &prev_attrs);
@@ -470,5 +717,23 @@ impl Row {
         }
 
         (prev_pos, prev_attrs)
+    }
+}
+
+// Wraps the row the cursor is waiting to wrap after (`prev_pos` is past its
+// end) without printing anything right after its last cell, and leaves the
+// cursor in the first column of the next row: a space wraps the row, and a
+// backspace returns over it. The character printed there next is printed with
+// the cursor moved to the first column, so it does not join the last cell of
+// the row above (Row::first_cell_joins), and it replaces the space. With the
+// cursor not past the end, nothing is written.
+fn write_wrap_apart(
+    contents: &mut Vec<u8>,
+    prev_pos: crate::grid::Pos,
+    cols: u16,
+) {
+    if prev_pos.col >= cols {
+        contents.push(b' ');
+        crate::term::Backspace.write_buf(contents);
     }
 }

@@ -245,6 +245,8 @@ impl Grid {
         let mut prev_attrs = crate::attrs::Attrs::default();
         let mut prev_pos = Pos::default();
         let mut wrapping = false;
+        let mut above = None;
+        let mut deferred = vec![];
         for (i, row) in self.visible_rows().enumerate() {
             // we limit the number of cols to a u16 (see Size), so
             // visible_rows() can never return more rows than will fit
@@ -255,13 +257,22 @@ impl Grid {
                 self.size.cols,
                 i,
                 wrapping,
+                above.filter(|_| wrapping),
+                Some(&mut deferred),
                 Some(prev_pos),
                 Some(prev_attrs),
             );
             prev_pos = new_pos;
             prev_attrs = new_attrs;
             wrapping = row.wrapped();
+            above = Some(row);
         }
+        self.write_deferred_runs(
+            contents,
+            &deferred,
+            &mut prev_pos,
+            &mut prev_attrs,
+        );
 
         self.write_cursor_position_formatted(
             contents,
@@ -281,6 +292,8 @@ impl Grid {
         let mut prev_pos = prev.pos;
         let mut wrapping = false;
         let mut prev_wrapping = false;
+        let mut above = None;
+        let mut deferred = vec![];
         for (i, (row, prev_row)) in
             self.visible_rows().zip(prev.visible_rows()).enumerate()
         {
@@ -295,6 +308,8 @@ impl Grid {
                 i,
                 wrapping,
                 prev_wrapping,
+                above.filter(|_| wrapping),
+                Some(&mut deferred),
                 prev_pos,
                 prev_attrs,
             );
@@ -302,7 +317,14 @@ impl Grid {
             prev_attrs = new_attrs;
             wrapping = row.wrapped();
             prev_wrapping = prev_row.wrapped();
+            above = Some(row);
         }
+        self.write_deferred_runs(
+            contents,
+            &deferred,
+            &mut prev_pos,
+            &mut prev_attrs,
+        );
 
         self.write_cursor_position_formatted(
             contents,
@@ -311,6 +333,60 @@ impl Grid {
         );
 
         prev_attrs
+    }
+
+    // Prints the cells Row::write_cell_apart deferred: the cells of a run of
+    // emoji cells kept apart that ends in the last column of its row, left
+    // erased so the cursor could wait to wrap after the row's last cell for
+    // the row below (or for the final cursor position).
+    fn write_deferred_runs(
+        &self,
+        contents: &mut Vec<u8>,
+        deferred: &[Pos],
+        prev_pos: &mut Pos,
+        prev_attrs: &mut crate::attrs::Attrs,
+    ) {
+        for &pos in deferred {
+            self.drawing_row(pos.row)
+                // write_cell_apart deferred a cell of a visible row
+                .unwrap()
+                .write_deferred_run(contents, pos, prev_pos, prev_attrs);
+        }
+    }
+
+    // Whether the cell starting at `pos`, the last one of its row, would join
+    // the cell before it when printed (Row::joins_left). Printing it so the
+    // cursor waits to wrap after it then needs DECSC and DECRC, which tmux
+    // 3.6a does not restore past the end of the row.
+    fn last_cell_joins(&self, pos: Pos) -> bool {
+        self.drawing_row(pos.row)
+            // the callers pass a cell of a visible row
+            .unwrap()
+            .joins_left(pos.col, 0)
+    }
+
+    // Prints the cell starting at `pos`, the last one of its row, so that the
+    // cursor waits to wrap after it, with the cursor at `prev_pos` (moved to
+    // `pos` first when unknown), and returns to the attributes `prev_attrs`.
+    // A cell that would join the cell before it is kept apart from it
+    // (Row::redraw_cell).
+    fn write_last_cell(
+        &self,
+        contents: &mut Vec<u8>,
+        prev_pos: Option<Pos>,
+        pos: Pos,
+        prev_attrs: crate::attrs::Attrs,
+    ) {
+        let mut cursor = prev_pos.unwrap_or_else(|| {
+            crate::term::MoveTo::new(pos).write_buf(contents);
+            pos
+        });
+        let mut attrs = prev_attrs;
+        self.drawing_row(pos.row)
+            // the callers pass a cell of a visible row
+            .unwrap()
+            .redraw_cell(contents, pos.row, pos.col, &mut cursor, &mut attrs);
+        prev_attrs.write_escape_code_diff(contents, &attrs);
     }
 
     pub fn write_cursor_position_formatted(
@@ -347,16 +423,15 @@ impl Grid {
                 // means that the first half of the wide character must be
                 // before it
                 self.drawing_cell(pos).unwrap();
-            if cell.has_contents() {
-                if let Some(prev_pos) = prev_pos {
-                    crate::term::MoveFromTo::new(prev_pos, pos)
-                        .write_buf(contents);
-                } else {
-                    crate::term::MoveTo::new(pos).write_buf(contents);
-                }
-                cell.attrs().write_escape_code_diff(contents, &prev_attrs);
-                contents.extend(cell.contents().as_bytes());
-                prev_attrs.write_escape_code_diff(contents, cell.attrs());
+            // a last cell that would join the cell before it (a pair of
+            // emoji cells the program wrote apart) is reached the way an
+            // empty one is, from the last cell of a row above and line feeds
+            // (which keep the cursor waiting to wrap, here and in tmux), and
+            // printed with DECSC and DECRC only when no row above has a last
+            // cell to print (see last_cell_joins)
+            let joins = cell.has_contents() && self.last_cell_joins(pos);
+            if cell.has_contents() && !joins {
+                self.write_last_cell(contents, prev_pos, pos, prev_attrs);
             } else {
                 // if the cell doesn't have contents, we can't have gotten
                 // here by drawing a character in the last column. this means
@@ -391,33 +466,12 @@ impl Grid {
                         // the first half of the wide character must be before
                         // it
                         .unwrap();
-                    if cell.has_contents() {
-                        if let Some(prev_pos) = prev_pos {
-                            if prev_pos.row != i
-                                || prev_pos.col < self.size.cols
-                            {
-                                crate::term::MoveFromTo::new(prev_pos, pos)
-                                    .write_buf(contents);
-                                cell.attrs().write_escape_code_diff(
-                                    contents,
-                                    &prev_attrs,
-                                );
-                                contents.extend(cell.contents().as_bytes());
-                                prev_attrs.write_escape_code_diff(
-                                    contents,
-                                    cell.attrs(),
-                                );
-                            }
-                        } else {
-                            crate::term::MoveTo::new(pos).write_buf(contents);
-                            cell.attrs().write_escape_code_diff(
-                                contents,
-                                &prev_attrs,
-                            );
-                            contents.extend(cell.contents().as_bytes());
-                            prev_attrs.write_escape_code_diff(
-                                contents,
-                                cell.attrs(),
+                    if cell.has_contents() && !self.last_cell_joins(pos) {
+                        if prev_pos.map_or(true, |prev_pos| {
+                            prev_pos.row != i || prev_pos.col < self.size.cols
+                        }) {
+                            self.write_last_cell(
+                                contents, prev_pos, pos, prev_attrs,
                             );
                         }
                         contents.extend(
@@ -435,7 +489,21 @@ impl Grid {
                 // there can't be something in the last column because we
                 // would have caught that above, so it should be safe to
                 // overwrite it.
-                if !found {
+                if !found && joins {
+                    pos = Pos {
+                        row: self.pos.row,
+                        col: self.size.cols - 1,
+                    };
+                    if self
+                        .drawing_cell(pos)
+                        // self.pos.row is valid, as is the last column
+                        .unwrap()
+                        .is_wide_continuation()
+                    {
+                        pos.col = self.size.cols - 2;
+                    }
+                    self.write_last_cell(contents, prev_pos, pos, prev_attrs);
+                } else if !found {
                     pos = Pos {
                         row: self.pos.row,
                         col: self.size.cols - 1,

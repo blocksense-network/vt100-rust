@@ -1,4 +1,6 @@
+use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr as _;
 
 // chosen to make the size of the cell struct 32 bytes
 const CONTENT_BYTES: usize = 22;
@@ -56,6 +58,44 @@ impl Cell {
     /// has no room for.
     pub(crate) fn can_append(&self) -> bool {
         self.len() < CONTENT_BYTES - 4
+    }
+
+    // Whether `c`, printed with the cursor right after this cell on its row,
+    // joins the emoji cluster the cell holds instead of taking a cell of its
+    // own (Screen::extend_emoji_cluster). An emoji ZWJ sequence, an emoji
+    // modifier sequence and a flag are each one extended grapheme cluster
+    // (https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries,
+    // GB11, GB9 and GB12/GB13), so `c` joins when it follows a ZWJ or is an
+    // emoji modifier or a regional indicator, and the cell with `c` is still
+    // one grapheme that unicode-width measures at most two columns wide. An
+    // empty cell holds no cluster (append would put a space before `c`), and
+    // a cell with no room for `c` is not joined either.
+    pub(crate) fn joins_cluster(&self, c: char) -> bool {
+        let contents = self.contents();
+        let joins = contents.ends_with('\u{200d}')
+            || matches!(c, '\u{1f3fb}'..='\u{1f3ff}' | '\u{1f1e6}'..='\u{1f1ff}');
+        if !joins || !self.has_contents() || !self.can_append() {
+            return false;
+        }
+        let mut cluster =
+            String::with_capacity(contents.len() + c.len_utf8());
+        cluster.push_str(contents);
+        cluster.push(c);
+        cluster.graphemes(true).nth(1).is_none() && cluster.width() <= 2
+    }
+
+    // Whether this cell, with `left` the cell before it on its row (the
+    // first half when that is a wide character), would join `left` when its
+    // contents are printed with the cursor right after `left`. The formatted
+    // output must not print it that way: it would rebuild one cell where
+    // this screen has two (see Row::write_cell).
+    pub(crate) fn would_join(&self, left: &Self) -> bool {
+        self.contents()
+            .chars()
+            .next()
+            // a cell's first character is never zero-width or a control
+            // character (Screen::text appends those to the cell before)
+            .is_some_and(|c| left.joins_cluster(c))
     }
 
     pub(crate) fn append(&mut self, c: char) {

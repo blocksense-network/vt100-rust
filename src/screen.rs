@@ -1,5 +1,4 @@
 use crate::term::BufWrite as _;
-use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthChar as _;
 use unicode_width::UnicodeWidthStr as _;
 
@@ -167,6 +166,8 @@ impl Screen {
             false,
             None,
             None,
+            None,
+            None,
         );
         contents
     }
@@ -324,6 +325,7 @@ impl Screen {
         width: u16,
     ) -> impl Iterator<Item = Vec<u8>> + '_ {
         let mut wrapping = false;
+        let mut above = None;
         self.grid().visible_rows().enumerate().map(move |(i, row)| {
             // number of rows in a grid is stored in a u16 (see Size), so
             // visible_rows can never return enough rows to overflow here
@@ -335,12 +337,15 @@ impl Screen {
                 width,
                 i,
                 wrapping,
+                above.filter(|_| wrapping),
+                None,
                 None,
                 None,
             );
             if start == 0 && width == self.grid.size().cols {
                 wrapping = row.wrapped();
             }
+            above = Some(row);
             contents
         })
     }
@@ -408,6 +413,8 @@ impl Screen {
                     i,
                     false,
                     false,
+                    None,
+                    None,
                     crate::grid::Pos { row: i, col: start },
                     crate::attrs::Attrs::default(),
                 );
@@ -1024,24 +1031,13 @@ impl Screen {
         let Some((prev_pos, true)) = self.cell_before_cursor() else {
             return false;
         };
-        let cell = self
+        if !self
             .grid()
             .drawing_cell(prev_pos)
             // cell_before_cursor returns a valid position
-            .unwrap();
-        let contents = cell.contents();
-        let joins = contents.ends_with('\u{200d}')
-            || matches!(c, '\u{1f3fb}'..='\u{1f3ff}' | '\u{1f1e6}'..='\u{1f1ff}');
-        // an empty cell holds no cluster to join (append would put a space
-        // before `c`)
-        if !joins || !cell.has_contents() || !cell.can_append() {
-            return false;
-        }
-        let mut cluster =
-            String::with_capacity(contents.len() + c.len_utf8());
-        cluster.push_str(contents);
-        cluster.push(c);
-        if cluster.graphemes(true).nth(1).is_some() || cluster.width() > 2 {
+            .unwrap()
+            .joins_cluster(c)
+        {
             return false;
         }
 
