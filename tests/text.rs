@@ -188,3 +188,215 @@ fn vs16_in_the_last_column() {
     // which ends the pending wrap there, so the `b` after it would be
     // printed over the character instead of wrapping.
 }
+
+// An emoji ZWJ sequence, an emoji with a skin-tone modifier and a flag (a
+// pair of regional indicators) are each one extended grapheme cluster
+// (https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries, GB11,
+// GB9, GB12/GB13) that unicode-width measures two columns wide, as tmux 3.6a
+// lays each out and as ratatui draws it: one wide cell, and the text after
+// it starts two columns on.
+#[test]
+fn an_emoji_cluster_takes_one_wide_cell() {
+    for cluster in [
+        // HEAVY BLACK HEART, VS16, ZWJ, FIRE
+        "\u{2764}\u{fe0f}\u{200d}\u{1f525}",
+        // WARNING SIGN, VS16, ZWJ, FIRE
+        "\u{26a0}\u{fe0f}\u{200d}\u{1f525}",
+        // MAN, ZWJ, WOMAN, ZWJ, GIRL
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+        // WAVING WHITE FLAG, VS16, ZWJ, RAINBOW
+        "\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}",
+        // THUMBS UP SIGN, EMOJI MODIFIER FITZPATRICK TYPE-4
+        "\u{1f44d}\u{1f3fd}",
+        // REGIONAL INDICATOR SYMBOL LETTERS B, G
+        "\u{1f1e7}\u{1f1ec}",
+    ] {
+        // Over stale text: the second column is the wide continuation.
+        let input = format!("\x1b[1;1HZZZZZZZZ\x1b[1;1H{cluster}X");
+        let mut parser = vt100::Parser::default();
+        parser.process(input.as_bytes());
+        assert_eq!(
+            cells(&parser, 0, 4),
+            [
+                wide_cell(cluster),
+                continuation(),
+                narrow_cell("X"),
+                narrow_cell("Z")
+            ],
+            "{cluster:?}"
+        );
+        assert_eq!(parser.screen().cursor_position(), (0, 3), "{cluster:?}");
+        assert_eq!(
+            parser.screen().contents(),
+            format!("{cluster}XZZZZZ"),
+            "{cluster:?}"
+        );
+        helpers::assert_reproduces_state(input.as_bytes());
+
+        // Cut between two writes after each code point, and inside the
+        // UTF-8 bytes of each.
+        let bytes = format!("{cluster}X").into_bytes();
+        for cut in 1..bytes.len() {
+            let mut parser = vt100::Parser::default();
+            parser.process(&bytes[..cut]);
+            parser.process(&bytes[cut..]);
+            assert_eq!(
+                cells(&parser, 0, 3),
+                [wide_cell(cluster), continuation(), narrow_cell("X")],
+                "{cluster:?} cut after {cut} bytes"
+            );
+        }
+    }
+
+    // A third regional indicator starts a new cluster: one column, as
+    // unicode-width counts a lone one.
+    let mut parser = vt100::Parser::default();
+    parser.process("\u{1f1e7}\u{1f1ec}\u{1f1e7}X".as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 4),
+        [
+            wide_cell("\u{1f1e7}\u{1f1ec}"),
+            continuation(),
+            narrow_cell("\u{1f1e7}"),
+            narrow_cell("X")
+        ]
+    );
+}
+
+// Characters that do not form an emoji cluster with the cell before them
+// keep their own cells: a ZWJ between two characters that are not emoji
+// (UAX #29 joins only Extended_Pictographic ones), and a cluster that
+// unicode-width measures wider than two columns, which no cell can hold and
+// which ratatui also lays out wider than two: HEAVY BLACK HEART, ZWJ, FIRE
+// without VS16 (three columns) and `a` with a skin-tone modifier.
+#[test]
+fn characters_outside_an_emoji_cluster_keep_their_cells() {
+    let mut parser = vt100::Parser::default();
+    parser.process("a\u{200d}bX".as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 3),
+        [narrow_cell("a\u{200d}"), narrow_cell("b"), narrow_cell("X")]
+    );
+
+    let mut parser = vt100::Parser::default();
+    parser.process("\u{30c7}\u{200d}\u{30c7}X".as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 5),
+        [
+            wide_cell("\u{30c7}\u{200d}"),
+            continuation(),
+            wide_cell("\u{30c7}"),
+            continuation(),
+            narrow_cell("X")
+        ]
+    );
+
+    let mut parser = vt100::Parser::default();
+    parser.process("\u{2764}\u{200d}\u{1f525}X".as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 4),
+        [
+            narrow_cell("\u{2764}\u{200d}"),
+            wide_cell("\u{1f525}"),
+            continuation(),
+            narrow_cell("X")
+        ]
+    );
+
+    let mut parser = vt100::Parser::default();
+    parser.process("a\u{1f3fd}X".as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 4),
+        [
+            narrow_cell("a"),
+            wide_cell("\u{1f3fd}"),
+            continuation(),
+            narrow_cell("X")
+        ]
+    );
+}
+
+// At the end of a row, as tmux 3.6a lays the clusters out on a 20-column
+// screen.
+#[test]
+fn an_emoji_cluster_at_the_end_of_a_row() {
+    // A ZWJ sequence that fits in the last two columns: the cursor waits
+    // after it, and the next character wraps.
+    let input = "\x1b[1;79H\u{2764}\u{fe0f}\u{200d}\u{1f525}X";
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 80)[78..],
+        [
+            wide_cell("\u{2764}\u{fe0f}\u{200d}\u{1f525}"),
+            continuation()
+        ]
+    );
+    assert_eq!(cells(&parser, 1, 2), [narrow_cell("X"), narrow_cell("")]);
+    assert!(parser.screen().row_wrapped(0));
+    helpers::assert_reproduces_state(input.as_bytes());
+
+    // A cluster that starts with a wide character in the last column wraps
+    // whole onto the next row.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let input = format!("\x1b[1;80H{family}X");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 1, 3),
+        [wide_cell(family), continuation(), narrow_cell("X")]
+    );
+    helpers::assert_reproduces_state(input.as_bytes());
+
+    // A flag that starts in the last column has no second column there:
+    // like a character with VS16, it stays one column wide, the cursor
+    // stays on it instead of waiting to wrap, and the next character is
+    // printed over it.
+    let input = "\x1b[1;80H\u{1f1e7}\u{1f1ec}";
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(cells(&parser, 0, 80)[79], narrow_cell("\u{1f1e7}\u{1f1ec}"));
+    assert_eq!(parser.screen().cursor_position(), (0, 79));
+    helpers::assert_reproduces_state(input.as_bytes());
+    parser.process(b"X");
+    assert_eq!(cells(&parser, 0, 80)[79], narrow_cell("X"));
+    assert_eq!(cells(&parser, 1, 1), [narrow_cell("")]);
+    assert!(!parser.screen().row_wrapped(0));
+}
+
+// A character that would join an emoji cluster joins the cell before the
+// cursor on the cursor's row only. With the cursor moved back to the first
+// column of a row the row above wrapped onto (here by a carriage return),
+// the cluster in the last column of the row above is not the character the
+// cursor follows: tmux 3.6a does not join across the row there, and prints
+// the character in the first column, over what was there.
+#[test]
+fn an_emoji_cluster_does_not_join_the_row_above() {
+    // A regional indicator in the last column, then one in the first
+    // column of the next row.
+    let input = format!("{}\u{1f1e7}X\r\u{1f1ec}Z", "a".repeat(79));
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(cells(&parser, 0, 80)[79], narrow_cell("\u{1f1e7}"));
+    assert_eq!(
+        cells(&parser, 1, 3),
+        [narrow_cell("\u{1f1ec}"), narrow_cell("Z"), narrow_cell("")]
+    );
+    assert_eq!(parser.screen().cursor_position(), (1, 2));
+
+    // An emoji with VS16 and a ZWJ in the last two columns, then FIRE in
+    // the first column of the next row.
+    let input =
+        format!("{}\u{2764}\u{fe0f}\u{200d}X\r\u{1f525}Z", "a".repeat(78));
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(
+        cells(&parser, 0, 80)[78..],
+        [wide_cell("\u{2764}\u{fe0f}\u{200d}"), continuation()]
+    );
+    assert_eq!(
+        cells(&parser, 1, 3),
+        [wide_cell("\u{1f525}"), continuation(), narrow_cell("Z")]
+    );
+    assert_eq!(parser.screen().cursor_position(), (1, 3));
+}

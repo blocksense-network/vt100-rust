@@ -52,11 +52,17 @@ impl Cell {
         self.attrs = a;
     }
 
+    /// Whether `append` has room for another codepoint; it drops one it
+    /// has no room for.
+    pub(crate) fn can_append(&self) -> bool {
+        self.len() < CONTENT_BYTES - 4
+    }
+
     pub(crate) fn append(&mut self, c: char) {
-        let len = self.len();
-        if len >= CONTENT_BYTES - 4 {
+        if !self.can_append() {
             return;
         }
+        let len = self.len();
         if len == 0 {
             self.contents[0] = b' ';
             self.len += 1;
@@ -81,8 +87,10 @@ impl Cell {
     /// Returns the text contents of the cell.
     ///
     /// Can include multiple unicode characters if combining characters are
-    /// used, but will contain at most one character with a non-zero character
-    /// width.
+    /// used. It holds one extended grapheme cluster: one character with a
+    /// non-zero character width and zero-width ones after it, or an emoji
+    /// cluster (a ZWJ sequence, an emoji with a skin-tone modifier, or a flag)
+    /// that unicode-width measures at most two columns wide as a whole.
     // Since contents has been constructed by appending chars encoded as UTF-8 it will be valid UTF-8
     #[allow(clippy::missing_panics_doc)]
     #[must_use]

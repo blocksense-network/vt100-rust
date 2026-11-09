@@ -1,4 +1,5 @@
 use crate::term::BufWrite as _;
+use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthChar as _;
 use unicode_width::UnicodeWidthStr as _;
 
@@ -159,7 +160,14 @@ impl Screen {
         let row = self.grid().row_by_global_index(index);
         let mut contents = vec![];
         row.write_contents_formatted(
-            &mut contents, 0, self.size().1, 0, false, None, None);
+            &mut contents,
+            0,
+            self.size().1,
+            0,
+            false,
+            None,
+            None,
+        );
         contents
     }
 
@@ -758,6 +766,10 @@ impl Screen {
             // width() can only return 0, 1, or 2
             .unwrap();
 
+        if width > 0 && self.extend_emoji_cluster(c) {
+            return;
+        }
+
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
         // character wraps because there was only one column left in the
@@ -786,86 +798,20 @@ impl Screen {
         let pos = self.grid().pos();
 
         if width == 0 {
-            if pos.col > 0 {
-                let mut prev_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col - 1,
-                    })
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.col - 1 is valid because we just
-                    // checked for pos.col > 0.
-                    .unwrap();
-                if prev_cell.is_wide_continuation() {
-                    prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row,
-                            col: pos.col - 2,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. we know pos.col - 2 is valid
-                        // because the cell at pos.col - 1 is a wide
-                        // continuation character, which means there must be
-                        // the first half of the wide character before it.
-                        .unwrap();
-                    prev_cell.append(c);
-                } else {
-                    prev_cell.append(c);
-                    if c == '\u{fe0f}' {
-                        self.widen_for_emoji_presentation(crate::grid::Pos {
-                            row: pos.row,
-                            col: pos.col - 1,
-                        });
-                    }
-                }
-            } else if pos.row > 0 {
-                let prev_row = self
-                    .grid()
-                    .drawing_row(pos.row - 1)
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.row - 1 is valid because we just
-                    // checked for pos.row > 0.
-                    .unwrap();
-                if prev_row.wrapped() {
-                    let mut prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row - 1,
-                            col: size.cols - 1,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. pos.row - 1 is valid because we
-                        // just checked for pos.row > 0. col of size.cols - 1
-                        // is always valid.
-                        .unwrap();
-                    if prev_cell.is_wide_continuation() {
-                        prev_cell = self
-                            .grid_mut()
-                            .drawing_cell_mut(crate::grid::Pos {
-                                row: pos.row - 1,
-                                col: size.cols - 2,
-                            })
-                            // pos.row is valid, since it comes directly from
-                            // self.grid().pos() which we assume to always
-                            // have a valid row value. pos.row - 1 is valid
-                            // because we just checked for pos.row > 0. col of
-                            // size.cols - 2 is valid because the cell at
-                            // size.cols - 1 is a wide continuation character,
-                            // so it must have the first half of the wide
-                            // character before it.
-                            .unwrap();
-                    }
-                    // the character is in the last column of its row, so a
-                    // VARIATION SELECTOR-16 has no column to widen it into
-                    // (see widen_for_emoji_presentation), and the cursor is
-                    // not waiting to wrap after it.
-                    prev_cell.append(c);
+            if let Some((prev_pos, on_cursor_row)) = self.cell_before_cursor()
+            {
+                self.grid_mut()
+                    .drawing_cell_mut(prev_pos)
+                    // cell_before_cursor returns a valid position
+                    .unwrap()
+                    .append(c);
+                // a character reached from the first column of the row below,
+                // after that row wrapped, is in the last column of its row: a
+                // VARIATION SELECTOR-16 has no column to widen it into (see
+                // widen_cluster), and the cursor is not waiting to wrap after
+                // it.
+                if c == '\u{fe0f}' && on_cursor_row {
+                    self.widen_cluster(prev_pos);
                 }
             }
         } else {
@@ -993,13 +939,129 @@ impl Screen {
         }
     }
 
+    // The cell holding the character the cursor follows, which a zero-width
+    // character is appended to, and whether it is on the cursor's row (right
+    // before the cursor) rather than in the last column of the row above,
+    // which wrapped onto the cursor's row. None when the cursor is in the
+    // first column and the row above did not wrap.
+    fn cell_before_cursor(&self) -> Option<(crate::grid::Pos, bool)> {
+        let pos = self.grid().pos();
+        let size = self.grid().size();
+        let (prev_pos, on_cursor_row) = if pos.col > 0 {
+            (
+                crate::grid::Pos {
+                    row: pos.row,
+                    col: pos.col - 1,
+                },
+                true,
+            )
+        } else if pos.row > 0
+            && self
+                .grid()
+                .drawing_row(pos.row - 1)
+                // pos.row is valid, since it comes directly from
+                // self.grid().pos() which we assume to always have a valid
+                // row value. pos.row - 1 is valid because we just checked
+                // for pos.row > 0.
+                .unwrap()
+                .wrapped()
+        {
+            (
+                crate::grid::Pos {
+                    row: pos.row - 1,
+                    col: size.cols - 1,
+                },
+                false,
+            )
+        } else {
+            return None;
+        };
+        if self
+            .grid()
+            .drawing_cell(prev_pos)
+            // prev_pos.row is the cursor's row or the one above it, both
+            // valid. prev_pos.col is pos.col - 1, valid because pos.col is
+            // at most size.cols, or the last column.
+            .unwrap()
+            .is_wide_continuation()
+        {
+            // the first half of a wide character is always before its
+            // continuation
+            return Some((
+                crate::grid::Pos {
+                    row: prev_pos.row,
+                    col: prev_pos.col - 1,
+                },
+                on_cursor_row,
+            ));
+        }
+        Some((prev_pos, on_cursor_row))
+    }
+
+    // An emoji ZWJ sequence, an emoji modifier sequence and a flag are each
+    // one extended grapheme cluster
+    // (https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries,
+    // GB11, GB9 and GB12/GB13) that unicode-width measures as a whole, two
+    // columns wide, as tmux lays them out and as ratatui draws them. Their
+    // later characters are not zero-width, so text() would give each one
+    // a cell of its own (a family of three is six columns wide). When `c` is
+    // the character after a ZWJ, an emoji modifier or a regional indicator,
+    // and it joins the cluster in the cell before the cursor, this appends
+    // it to that cell and, when the cluster is now two columns wide, widens
+    // the cell as widen_cluster does; it returns whether it did.
+    //
+    // A cluster unicode-width measures wider than two columns (HEAVY BLACK
+    // HEART, ZWJ, FIRE without VS16 is three, and so is `a` with a skin-tone
+    // modifier) does not fit in a cell, and ratatui lays it out as wide as
+    // that too, so its characters keep their own cells. Neither does one
+    // the cell has no room for.
+    //
+    // Only a cell on the cursor's row is joined. In the first column the
+    // cursor was moved there (printing never leaves it there), so the last
+    // cell of the row above is not the character it follows; tmux does not
+    // join across the row either, and prints `c` in the first column.
+    fn extend_emoji_cluster(&mut self, c: char) -> bool {
+        let Some((prev_pos, true)) = self.cell_before_cursor() else {
+            return false;
+        };
+        let cell = self
+            .grid()
+            .drawing_cell(prev_pos)
+            // cell_before_cursor returns a valid position
+            .unwrap();
+        let contents = cell.contents();
+        let joins = contents.ends_with('\u{200d}')
+            || matches!(c, '\u{1f3fb}'..='\u{1f3ff}' | '\u{1f1e6}'..='\u{1f1ff}');
+        // an empty cell holds no cluster to join (append would put a space
+        // before `c`)
+        if !joins || !cell.has_contents() || !cell.can_append() {
+            return false;
+        }
+        let mut cluster =
+            String::with_capacity(contents.len() + c.len_utf8());
+        cluster.push_str(contents);
+        cluster.push(c);
+        if cluster.graphemes(true).nth(1).is_some() || cluster.width() > 2 {
+            return false;
+        }
+
+        self.grid_mut()
+            .drawing_cell_mut(prev_pos)
+            // cell_before_cursor returns a valid position
+            .unwrap()
+            .append(c);
+        self.widen_cluster(prev_pos);
+        true
+    }
+
     // VARIATION SELECTOR-16 (U+FE0F) asks for the emoji presentation of the
     // character before it (https://www.unicode.org/reports/tr51/#Presentation_Style),
     // and an emoji base with it is two columns wide, as unicode-width counts
     // the cell's contents and as tmux and the programs that print it lay it
-    // out. The selector has just been appended to the narrow cell at `pos`,
-    // with the cursor right after that cell. If the contents are now two
-    // columns wide, this makes the cell a wide character, the way text()
+    // out; so are the emoji clusters extend_emoji_cluster joins. A selector
+    // or a cluster's character has just been appended to the narrow cell at
+    // `pos`, with the cursor right after that cell. If the contents are now
+    // two columns wide, this makes the cell a wide character, the way text()
     // places one: the next cell becomes its continuation (clearing the
     // other half of a wide character that started there), and the cursor
     // moves past it. A base with no emoji presentation (`a` U+FE0F) stays
@@ -1008,7 +1070,7 @@ impl Screen {
     // A character in the last column has no second column. tmux keeps it
     // one column wide there and ends the pending wrap with the cursor on
     // it, so the next character is printed over it, not on the next row.
-    fn widen_for_emoji_presentation(&mut self, pos: crate::grid::Pos) {
+    fn widen_cluster(&mut self, pos: crate::grid::Pos) {
         let size = self.grid().size();
         let attrs = self.attrs;
 
@@ -1017,10 +1079,7 @@ impl Screen {
             .drawing_cell(pos)
             // the caller passes the cell it just appended to
             .unwrap();
-        if cell.is_wide()
-            || !cell.contents().ends_with('\u{fe0f}')
-            || cell.contents().width() != 2
-        {
+        if cell.is_wide() || cell.contents().width() != 2 {
             return;
         }
 
