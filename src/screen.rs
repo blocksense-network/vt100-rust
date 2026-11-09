@@ -1,5 +1,6 @@
 use crate::term::BufWrite as _;
 use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr as _;
 
 const MODE_APPLICATION_KEYPAD: u8 = 0b0000_0001;
 const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
@@ -811,8 +812,16 @@ impl Screen {
                         // continuation character, which means there must be
                         // the first half of the wide character before it.
                         .unwrap();
+                    prev_cell.append(c);
+                } else {
+                    prev_cell.append(c);
+                    if c == '\u{fe0f}' {
+                        self.widen_for_emoji_presentation(crate::grid::Pos {
+                            row: pos.row,
+                            col: pos.col - 1,
+                        });
+                    }
                 }
-                prev_cell.append(c);
             } else if pos.row > 0 {
                 let prev_row = self
                     .grid()
@@ -852,6 +861,10 @@ impl Screen {
                             // character before it.
                             .unwrap();
                     }
+                    // the character is in the last column of its row, so a
+                    // VARIATION SELECTOR-16 has no column to widen it into
+                    // (see widen_for_emoji_presentation), and the cursor is
+                    // not waiting to wrap after it.
                     prev_cell.append(c);
                 }
             }
@@ -980,6 +993,87 @@ impl Screen {
         }
     }
 
+    // VARIATION SELECTOR-16 (U+FE0F) asks for the emoji presentation of the
+    // character before it (https://www.unicode.org/reports/tr51/#Presentation_Style),
+    // and an emoji base with it is two columns wide, as unicode-width counts
+    // the cell's contents and as tmux and the programs that print it lay it
+    // out. The selector has just been appended to the narrow cell at `pos`,
+    // with the cursor right after that cell. If the contents are now two
+    // columns wide, this makes the cell a wide character, the way text()
+    // places one: the next cell becomes its continuation (clearing the
+    // other half of a wide character that started there), and the cursor
+    // moves past it. A base with no emoji presentation (`a` U+FE0F) stays
+    // one column wide, as unicode-width counts it.
+    //
+    // A character in the last column has no second column. tmux keeps it
+    // one column wide there and ends the pending wrap with the cursor on
+    // it, so the next character is printed over it, not on the next row.
+    fn widen_for_emoji_presentation(&mut self, pos: crate::grid::Pos) {
+        let size = self.grid().size();
+        let attrs = self.attrs;
+
+        let cell = self
+            .grid()
+            .drawing_cell(pos)
+            // the caller passes the cell it just appended to
+            .unwrap();
+        if cell.is_wide()
+            || !cell.contents().ends_with('\u{fe0f}')
+            || cell.contents().width() != 2
+        {
+            return;
+        }
+
+        if pos.col == size.cols - 1 {
+            // the cursor is right after the last column: a pending wrap
+            self.grid_mut().col_set(size.cols - 1);
+            return;
+        }
+
+        let next_pos = crate::grid::Pos {
+            row: pos.row,
+            col: pos.col + 1,
+        };
+        if self
+            .grid()
+            .drawing_cell(next_pos)
+            // pos.col is not the last column (checked above)
+            .unwrap()
+            .is_wide()
+        {
+            let next_next_pos = crate::grid::Pos {
+                row: pos.row,
+                col: pos.col + 2,
+            };
+            self.grid_mut()
+                .drawing_cell_mut(next_next_pos)
+                // the cell at next_pos is wide, so it must have the second
+                // half of the wide character after it
+                .unwrap()
+                .clear(attrs);
+            if next_next_pos.col == size.cols - 1 {
+                self.grid_mut()
+                    .drawing_row_mut(pos.row)
+                    // pos.row is the cursor's row, which is always valid
+                    .unwrap()
+                    .wrap(false);
+            }
+        }
+        let next_cell = self
+            .grid_mut()
+            .drawing_cell_mut(next_pos)
+            // pos.col is not the last column (checked above)
+            .unwrap();
+        next_cell.clear(crate::attrs::Attrs::default());
+        next_cell.set_wide_continuation(true);
+        self.grid_mut()
+            .drawing_cell_mut(pos)
+            // the caller passes the cell it just appended to
+            .unwrap()
+            .set_wide(true);
+        self.grid_mut().col_inc(1);
+    }
+
     // control codes
 
     pub(crate) fn bs(&mut self) {
@@ -1048,11 +1142,25 @@ impl Screen {
     // CSI A
     pub(crate) fn cuu(&mut self, offset: u16) {
         self.grid_mut().row_dec_clamp(offset);
+        self.end_pending_wrap();
     }
 
     // CSI B
     pub(crate) fn cud(&mut self, offset: u16) {
         self.grid_mut().row_inc_clamp(offset);
+        self.end_pending_wrap();
+    }
+
+    // a character in the last column leaves the cursor past it, waiting to
+    // wrap. xterm and tmux end that wait on a cursor up or down, and leave
+    // the cursor in the last column of the row moved to, so the next
+    // character is printed there
+    // (https://invisible-island.net/xterm/ctlseqs/ctlseqs.html, CUU and CUD).
+    fn end_pending_wrap(&mut self) {
+        let cols = self.grid().size().cols;
+        if self.grid().pos().col >= cols {
+            self.grid_mut().col_set(cols - 1);
+        }
     }
 
     // CSI C
