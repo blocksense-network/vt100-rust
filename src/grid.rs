@@ -335,23 +335,43 @@ impl Grid {
         prev_attrs
     }
 
-    // Prints the cells Row::write_cell_apart deferred: the cells of a run of
-    // emoji cells kept apart that ends in the last column of its row, left
-    // erased so the cursor could wait to wrap after the row's last cell for
-    // the row below (or for the final cursor position).
+    // Prints what the rows left to print after them, so the cursor could
+    // wait to wrap after a row's last cell for the row below (or for the
+    // final cursor position): the cells of a run of emoji cells kept apart
+    // that ends in the last column of its row, left erased
+    // (Row::write_cell_apart), and the last cell of a wrapped row that holds
+    // the cursor on it, left a space (Row::write_held_cell_waiting).
     fn write_deferred_runs(
         &self,
         contents: &mut Vec<u8>,
-        deferred: &[Pos],
+        deferred: &[crate::row::Deferred],
         prev_pos: &mut Pos,
         prev_attrs: &mut crate::attrs::Attrs,
     ) {
-        for &pos in deferred {
-            self.drawing_row(pos.row)
-                // write_cell_apart deferred a cell of a visible row
-                .unwrap()
-                .write_deferred_run(contents, pos, prev_pos, prev_attrs);
+        for &item in deferred {
+            match item {
+                crate::row::Deferred::Run(pos) => self
+                    .drawing_row(pos.row)
+                    // write_cell_apart deferred a cell of a visible row
+                    .unwrap()
+                    .write_deferred_run(contents, pos, prev_pos, prev_attrs),
+                crate::row::Deferred::Cell(pos) => self
+                    .drawing_row(pos.row)
+                    // write_held_cell_waiting deferred a cell of a visible row
+                    .unwrap()
+                    .write_deferred_cell(contents, pos, prev_pos, prev_attrs),
+            }
         }
+    }
+
+    // Whether the cell starting at `pos`, the last one of its row, holds the
+    // cursor on it when printed (Row::holds_cursor), so printing it cannot
+    // leave the cursor waiting to wrap after it.
+    fn last_cell_holds_cursor(&self, pos: Pos) -> bool {
+        self.drawing_row(pos.row)
+            // the callers pass a cell of a visible row
+            .unwrap()
+            .holds_cursor(pos.col)
     }
 
     // Whether the cell starting at `pos`, the last one of its row, would join
@@ -429,7 +449,10 @@ impl Grid {
             // (which keep the cursor waiting to wrap, here and in tmux), and
             // printed with DECSC and DECRC only when no row above has a last
             // cell to print (see last_cell_joins)
-            let joins = cell.has_contents() && self.last_cell_joins(pos);
+            // and so is a last cell that holds the cursor on it when printed
+            let joins = cell.has_contents()
+                && (self.last_cell_joins(pos)
+                    || self.last_cell_holds_cursor(pos));
             if cell.has_contents() && !joins {
                 self.write_last_cell(contents, prev_pos, pos, prev_attrs);
             } else {
@@ -466,7 +489,10 @@ impl Grid {
                         // the first half of the wide character must be before
                         // it
                         .unwrap();
-                    if cell.has_contents() && !self.last_cell_joins(pos) {
+                    if cell.has_contents()
+                        && !self.last_cell_joins(pos)
+                        && !self.last_cell_holds_cursor(pos)
+                    {
                         if prev_pos.map_or(true, |prev_pos| {
                             prev_pos.row != i || prev_pos.col < self.size.cols
                         }) {

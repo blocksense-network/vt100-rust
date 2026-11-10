@@ -694,3 +694,131 @@ fn a_diff_keeps_emoji_cells_written_apart_apart() {
         format!("\x1b[2;1H{}{THUMBS_UP}x", "a".repeat(78)).as_bytes(),
     );
 }
+
+const RI_G: &str = "\u{1f1ec}";
+
+// A cluster completed in the last column (a second regional indicator, or
+// VS16 after an emoji base) stays one column wide there with the cursor on
+// it, as in tmux 3.6a. Printed whole, it does not leave the cursor waiting to
+// wrap, so when its row is wrapped the replay prints the row's last cell as a
+// space first (the next row's first character wraps the row after it) and
+// the cell again after all the rows. tmux 3.6a, in a 10x4 pane, keeps the
+// flag in the last column of the wrapped row with the cursor on it, for the
+// program's bytes and for that replay alike.
+#[test]
+fn a_cluster_completed_in_the_last_column_of_a_wrapped_row_is_replayed() {
+    for (input, last) in [
+        (
+            format!("\x1b[2;80H{RI_G}x\x1b[2;80H{RI_G}{RI_G}"),
+            format!("{RI_G}{RI_G}"),
+        ),
+        (
+            "\x1b[2;80H\u{26a0}x\x1b[2;80H\u{26a0}\u{fe0f}".to_string(),
+            "\u{26a0}\u{fe0f}".to_string(),
+        ),
+    ] {
+        let mut parser = vt100::Parser::default();
+        parser.process(input.as_bytes());
+        assert!(parser.screen().row_wrapped(1), "{input:?}");
+        assert_eq!(
+            cells(&parser, 1, 80)[79],
+            narrow_cell(&last),
+            "{input:?}"
+        );
+        assert_eq!(parser.screen().cursor_position(), (1, 79), "{input:?}");
+        helpers::assert_reproduces_state(input.as_bytes());
+        assert!(!restores_a_saved_cursor(
+            &parser.screen().contents_formatted()
+        ));
+    }
+
+    // The randomized sweep's input that found it (80x24).
+    helpers::assert_reproduces_state(
+        "\x1b[3;47H\x1b[2;78H\u{1f44d}\x1b[P\u{1f1ec}\x1b[X\u{1f1ec}\x08\x1b[C\u{1f525}\x08\ra"
+            .as_bytes(),
+    );
+
+    // The row wraps only in the new screen, or stops wrapping there.
+    helpers::assert_reproduces_state_from(
+        format!("\x1b[2;80H{RI_G}x\x1b[2;80H{RI_G}{RI_G}").as_bytes(),
+        format!("\x1b[2;80H{RI_G}{RI_G}").as_bytes(),
+    );
+    helpers::assert_reproduces_state_from(
+        format!("\x1b[2;80H{RI_G}{RI_G}\x1b[3;1HQ").as_bytes(),
+        format!("\x1b[2;80H{RI_G}x").as_bytes(),
+    );
+}
+
+// Without a wrap, the cell is printed whole and the cursor stays on it, so a
+// replay that moves on from there starts in the last column, not past it.
+#[test]
+fn the_cursor_stays_on_a_cluster_completed_in_the_last_column() {
+    let input = format!("\x1b[2;80H{RI_G}{RI_G}");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert!(!parser.screen().row_wrapped(1));
+    assert_eq!(parser.screen().cursor_position(), (1, 79));
+    helpers::assert_reproduces_state(input.as_bytes());
+    helpers::assert_reproduces_state(format!("{input}\x1b[3;1Hy").as_bytes());
+}
+
+// A cursor waiting to wrap on the row of such a cell (LF keeps it waiting; on
+// the first row, VPA) cannot get there by printing the cell, which holds the
+// cursor on it: it is reached from the last cell of a row above and line
+// feeds, as for an empty last cell. tmux 3.6a, in a 10x4 pane, wraps the row
+// on the next character after both inputs.
+#[test]
+fn the_cursor_waits_to_wrap_after_a_cluster_completed_in_the_last_column() {
+    let input = format!("\x1b[2;80H{RI_G}{RI_G}\x1b[1;80HQ\n");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(parser.screen().cursor_position(), (1, 80));
+    helpers::assert_reproduces_state(input.as_bytes());
+    assert!(!restores_a_saved_cursor(&parser.screen().state_formatted()));
+    helpers::assert_reproduces_state(format!("{input}Z").as_bytes());
+
+    let input = format!("\x1b[1;80H{RI_G}{RI_G}\x1b[3;80HQ\x1b[1d");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(parser.screen().cursor_position(), (0, 80));
+    helpers::assert_reproduces_state(input.as_bytes());
+}
+
+// Such a cell can also follow a cell its first character would join (the
+// program printed a lone regional indicator before it afterwards). The
+// replay keeps the two apart as for any such pair, and still leaves the
+// cursor waiting to wrap after the cell when its row is wrapped, or when the
+// cursor waits there with no row above to reach it from.
+#[test]
+fn a_cluster_completed_in_the_last_column_after_a_cell_it_joins_is_replayed()
+{
+    let input = format!(
+        "\x1b[2;80H{RI_G}x\x1b[2;80H{RI_G}{RI_G}\x1b[2;79H{RI_G}\x1b[5;1H"
+    );
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert!(parser.screen().row_wrapped(1));
+    let row = cells(&parser, 1, 80);
+    assert_eq!(row[78], narrow_cell(RI_G));
+    assert_eq!(row[79], narrow_cell(&format!("{RI_G}{RI_G}")));
+    helpers::assert_reproduces_state(input.as_bytes());
+    assert!(!restores_a_saved_cursor(
+        &parser.screen().contents_formatted()
+    ));
+    helpers::assert_reproduces_state_from(
+        format!("\x1b[2;79H{RI_G}\x1b[5;1H").as_bytes(),
+        format!("\x1b[2;80H{RI_G}x\x1b[2;80H{RI_G}{RI_G}").as_bytes(),
+    );
+    helpers::assert_reproduces_state_from(
+        format!("\x1b[2;80H{RI_G}{RI_G}\x1b[2;79H{RI_G}\x1b[5;1H").as_bytes(),
+        format!("\x1b[2;80H{RI_G}x").as_bytes(),
+    );
+
+    let input =
+        format!("\x1b[1;80H{RI_G}{RI_G}\x1b[1;79H{RI_G}\x1b[3;80HQ\x1b[1d");
+    let mut parser = vt100::Parser::default();
+    parser.process(input.as_bytes());
+    assert_eq!(parser.screen().cursor_position(), (0, 80));
+    helpers::assert_reproduces_state(input.as_bytes());
+    helpers::assert_reproduces_state(format!("{input}Z").as_bytes());
+}
