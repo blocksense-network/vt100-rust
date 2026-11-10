@@ -316,7 +316,7 @@ impl Row {
     ) {
         let pos = crate::grid::Pos { row, col };
         let cell = &self.cells[usize::from(col)];
-        crate::term::MoveFromTo::new(*prev_pos, pos).write_buf(contents);
+        crate::term::MoveFromToInRow::new(*prev_pos, pos).write_buf(contents);
         if prev_attrs != cell.attrs() {
             cell.attrs().write_escape_code_diff(contents, prev_attrs);
             *prev_attrs = *cell.attrs();
@@ -348,7 +348,7 @@ impl Row {
         } else if self.holds_cursor(col) {
             let pos = crate::grid::Pos { row, col };
             let cell = &self.cells[usize::from(col)];
-            crate::term::MoveFromTo::new(*prev_pos, pos).write_buf(contents);
+            crate::term::MoveFromToInRow::new(*prev_pos, pos).write_buf(contents);
             if prev_attrs != cell.attrs() {
                 cell.attrs().write_escape_code_diff(contents, prev_attrs);
                 *prev_attrs = *cell.attrs();
@@ -408,7 +408,7 @@ impl Row {
             first = self.left_cell_start(first, start).unwrap();
         }
         let first_pos = crate::grid::Pos { row, col: first };
-        crate::term::MoveFromTo::new(*prev_pos, first_pos)
+        crate::term::MoveFromToInRow::new(*prev_pos, first_pos)
             .write_buf(contents);
         crate::term::EraseChar::new(col - first).write_buf(contents);
         *prev_pos = first_pos;
@@ -416,7 +416,7 @@ impl Row {
         if wait && self.holds_cursor(col) {
             let pos = crate::grid::Pos { row, col };
             let cell = &self.cells[usize::from(col)];
-            crate::term::MoveFromTo::new(*prev_pos, pos).write_buf(contents);
+            crate::term::MoveFromToInRow::new(*prev_pos, pos).write_buf(contents);
             *prev_pos = pos;
             if prev_attrs != cell.attrs() {
                 cell.attrs().write_escape_code_diff(contents, prev_attrs);

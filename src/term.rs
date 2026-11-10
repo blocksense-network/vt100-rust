@@ -383,6 +383,58 @@ impl BufWrite for MoveFromTo {
     }
 }
 
+/// Like [`MoveFromTo`], for a move within one row that a row formatted on
+/// its own (`Screen::rows_formatted`) may make: a move back along the row is
+/// a CHA ([`MoveToCol`]), which keeps to the row the cursor is on, so the row
+/// can be printed on any row. An absolute position would name the row's own
+/// index. A move to another row is absolute, as in `MoveFromTo`.
+#[derive(Default, Debug)]
+#[must_use = "this struct does nothing unless you call write_buf"]
+pub struct MoveFromToInRow {
+    from: crate::grid::Pos,
+    to: crate::grid::Pos,
+}
+
+impl MoveFromToInRow {
+    pub fn new(from: crate::grid::Pos, to: crate::grid::Pos) -> Self {
+        Self { from, to }
+    }
+}
+
+impl BufWrite for MoveFromToInRow {
+    fn write_buf(&self, buf: &mut Vec<u8>) {
+        if self.from.row == self.to.row && self.to.col < self.from.col {
+            MoveToCol::new(self.to.col).write_buf(buf);
+        } else {
+            MoveFromTo::new(self.from, self.to).write_buf(buf);
+        }
+    }
+}
+
+/// CHA (`CSI Ps G`): moves the cursor to a column of the row it is on, and
+/// ends a pending wrap
+/// (<https://invisible-island.net/xterm/ctlseqs/ctlseqs.html>, `CHA`;
+/// ECMA-48 8.3.9).
+#[derive(Default, Debug)]
+#[must_use = "this struct does nothing unless you call write_buf"]
+pub struct MoveToCol {
+    col: u16,
+}
+
+impl MoveToCol {
+    pub fn new(col: u16) -> Self {
+        Self { col }
+    }
+}
+
+impl BufWrite for MoveToCol {
+    fn write_buf(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(b"\x1b[");
+        extend_itoa(buf, self.col + 1);
+        buf.push(b'G');
+    }
+}
+
 #[derive(Default, Debug)]
 #[must_use = "this struct does nothing unless you call write_buf"]
 pub struct ApplicationKeypad {

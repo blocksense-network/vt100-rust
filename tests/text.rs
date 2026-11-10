@@ -822,3 +822,43 @@ fn a_cluster_completed_in_the_last_column_after_a_cell_it_joins_is_replayed()
     helpers::assert_reproduces_state(input.as_bytes());
     helpers::assert_reproduces_state(format!("{input}Z").as_bytes());
 }
+
+// A row formatted on its own (rows_formatted) can be printed on any row: the
+// caller positions the cursor, and the formatter's moves within the row must
+// keep it there. A cell kept apart from the cell before it is printed by
+// moving back along the row; that move was an absolute cursor position on
+// the row's own index, so printed on another row the rest of it landed on
+// that index. A move back on the same row is a CHA (`CSI Ps G`, ECMA-48
+// 8.3.9), which keeps the row.
+#[test]
+fn a_row_formatted_on_its_own_stays_on_the_row_it_is_printed_on() {
+    for input in [
+        // a modifier written before its base
+        format!("\x1b[1;3H{SKIN_TONE}\x1b[1;1H{THUMBS_UP}"),
+        // a flag completed in the last column of a wrapped row
+        format!("\x1b[1;80H{RI_G}x\x1b[1;80H{RI_G}{RI_G}\x1b[H"),
+    ] {
+        let mut parser = vt100::Parser::default();
+        parser.process(input.as_bytes());
+        let source: Vec<String> = parser.screen().rows(0, 80).take(2).collect();
+        let row = parser.screen().rows_formatted(0, 80).next().unwrap();
+
+        // Printed on row 4 of a fresh screen, the row is there and only there.
+        let mut replay = vt100::Parser::default();
+        replay.process(b"\x1b[4;1H");
+        replay.process(&row);
+        let rows: Vec<String> = replay.screen().rows(0, 80).take(5).collect();
+        assert_eq!(
+            rows,
+            ["", "", "", source[0].as_str(), ""],
+            "{input:?} -> {}",
+            helpers::format_bytes(&row)
+        );
+        assert_eq!(
+            cells(&replay, 3, 80),
+            cells(&parser, 0, 80),
+            "{input:?} -> {}",
+            helpers::format_bytes(&row)
+        );
+    }
+}
