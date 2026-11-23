@@ -75,11 +75,11 @@ const OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// Output arrives in chunks of this size, as a PTY read delivers it.
 const CHUNK: usize = 64 * 1024;
 
-/// Feed `opening`, then [`OUTPUT_BYTES`] of `filler` in [`CHUNK`]-sized
+/// Feed `opening`, then [`OUTPUT_BYTES`] of `filler` repeated in [`CHUNK`]-sized
 /// pieces, to a fresh parser, and return how far the heap rose above where
 /// it was before the parser existed.
-fn heap_growth(opening: &[u8], filler: u8) -> usize {
-    let chunk = vec![filler; CHUNK];
+fn heap_growth(opening: &[u8], filler: &[u8]) -> usize {
+    let chunk: Vec<u8> = filler.iter().copied().cycle().take(CHUNK).collect();
     let before = reset_peak();
     {
         let mut parser = vt100::Parser::new(24, 80, 0);
@@ -103,25 +103,24 @@ fn an_unterminated_osc_keeps_the_heap_bounded() {
     // (`Vec` doubling can leave up to twice the limit allocated) — four
     // orders of magnitude below the output it reads.
     let budget = 4 * vt100::OSC_PAYLOAD_LIMIT + 1024 * 1024;
-    let cases: &[(&str, &[u8], u8)] = &[
-        ("a plain OSC opening", b"\x1b]", b'a'),
-        ("a title OSC", b"\x1b]0;", b'x'),
-        // Every `;` opens a parameter; they must count toward nothing that
-        // grows either.
-        ("an OSC of separators", b"\x1b]", b';'),
+    let cases: &[(&str, &[u8], &[u8])] = &[
+        ("a plain OSC opening", b"\x1b]", b"a"),
+        ("a title OSC", b"\x1b]0;", b"x"),
+        // Separators between payload bytes: every `;` opens a parameter.
+        ("an OSC of short parameters", b"\x1b]", b"a;"),
         // Bytes vte ignores inside an OSC (here LF) do not end it.
-        ("an OSC of line feeds", b"\x1b]2;", b'\n'),
+        ("an OSC of lines", b"\x1b]2;", b"line of text\n"),
         // C0 controls between ESC and `]` keep vte in the escape state, so
         // this still opens an OSC.
-        ("an opening interrupted by C0", b"\x1b\r\x00]", b'z'),
+        ("an opening interrupted by C0", b"\x1b\r\x00]", b"z"),
         // An OSC opened from inside a CSI sequence and after a DCS.
-        ("an opening inside a CSI", b"\x1b[12\x1b]", b'c'),
-        ("an opening after a DCS", b"\x1bPq#0\x1b]", b'd'),
+        ("an opening inside a CSI", b"\x1b[12\x1b]", b"c"),
+        ("an opening after a DCS", b"\x1bPq#0\x1b]", b"d"),
         // Bytes above 0x7F are OSC payload too.
-        ("an OSC of high bytes", b"\x1b]8;;", 0xC3),
+        ("an OSC of high bytes", b"\x1b]8;;", b"\xc3\xa9"),
     ];
     for (what, opening, filler) in cases {
-        let growth = heap_growth(opening, *filler);
+        let growth = heap_growth(opening, filler);
         assert!(
             growth <= budget,
             "{what}: the heap rose {growth} bytes while the parser read \

@@ -176,3 +176,29 @@ fn osc_sequences_within_the_limit_are_unchanged() {
     assert_eq!(parser.callbacks().unhandled.len(), 400);
     assert_eq!(parser.callbacks().bells, 0);
 }
+
+#[test]
+fn text_that_vte_prints_is_never_dropped() {
+    // vte 0.15 drops an ESC in one case: a read that completes a UTF-8
+    // character left incomplete by the previous read, when the bytes it
+    // copies for that hold the character, an ESC and then an invalid or
+    // incomplete byte. Here the second read starts "\x80 ESC \xC3": vte
+    // completes "À", counts the ESC as consumed, and stays in ground, so
+    // the "]" that follows is printed and so is everything after it. A
+    // guard that took "ESC \xC3 ]" for an OSC opening would drop the text
+    // past the limit, "TAIL" included.
+    let mut parser = parser();
+    parser.process(b"x\xc3");
+    let mut second = b"\x80\x1b\xc3]".to_vec();
+    second.extend(std::iter::repeat(b'a').take(LIMIT + 4096));
+    second.extend_from_slice(b"TAIL");
+    parser.process(&second);
+    assert!(
+        parser.screen().contents().ends_with("TAIL"),
+        "the text vte printed reaches the screen"
+    );
+    assert!(
+        parser.callbacks().unhandled.is_empty(),
+        "no OSC was dispatched"
+    );
+}
