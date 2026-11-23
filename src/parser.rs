@@ -2,6 +2,9 @@
 /// the terminal contents.
 pub struct Parser<CB: crate::callbacks::Callbacks = ()> {
     parser: vte::Parser,
+    /// Keeps the OSC payload `vte` buffers within
+    /// [`OSC_PAYLOAD_LIMIT`](crate::OSC_PAYLOAD_LIMIT).
+    osc_guard: crate::osc_guard::OscGuard,
     screen: crate::perform::WrappedScreen<CB>,
 }
 
@@ -12,6 +15,7 @@ impl Parser {
     pub fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
         Self {
             parser: vte::Parser::new(),
+            osc_guard: crate::osc_guard::OscGuard::default(),
             screen: crate::perform::WrappedScreen::new(
                 rows,
                 cols,
@@ -34,6 +38,7 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
     ) -> Self {
         Self {
             parser: vte::Parser::new(),
+            osc_guard: crate::osc_guard::OscGuard::default(),
             screen: crate::perform::WrappedScreen::new_with_callbacks(
                 rows,
                 cols,
@@ -45,8 +50,18 @@ impl<CB: crate::callbacks::Callbacks> Parser<CB> {
 
     /// Processes the contents of the given byte string, and updates the
     /// in-memory terminal state.
+    ///
+    /// The payload kept for one OSC sequence is limited to
+    /// [`OSC_PAYLOAD_LIMIT`](crate::OSC_PAYLOAD_LIMIT) bytes; the rest of an
+    /// oversized OSC is dropped, so the parser's memory does not grow with
+    /// its input.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.screen, bytes);
+        let Self {
+            parser,
+            osc_guard,
+            screen,
+        } = self;
+        osc_guard.filter(bytes, |run| parser.advance(screen, run));
     }
 
     /// Returns a reference to a [`Screen`](crate::Screen) object containing
