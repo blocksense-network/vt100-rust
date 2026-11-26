@@ -33,6 +33,7 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
 impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     fn print(&mut self, c: char) {
         if c == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&c) {
+            self.screen.clear_last_char();
             self.callbacks.unhandled_char(&mut self.screen, c);
         } else {
             self.screen.text(c);
@@ -40,6 +41,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     }
 
     fn execute(&mut self, b: u8) {
+        self.screen.clear_last_char();
         match b {
             7 => self.callbacks.audible_bell(&mut self.screen),
             8 => self.screen.bs(),
@@ -55,7 +57,18 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         }
     }
 
+    fn hook(
+        &mut self,
+        _params: &vte::Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        _action: char,
+    ) {
+        self.screen.clear_last_char();
+    }
+
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
+        self.screen.clear_last_char();
         if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
@@ -93,6 +106,9 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
+        if !(intermediates.is_empty() && c == 'b') {
+            self.screen.clear_last_char();
+        }
         let unhandled = |screen: &mut crate::screen::Screen| {
             self.callbacks.unhandled_csi(
                 screen,
@@ -125,6 +141,9 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'S' => self.screen.su(canonicalize_params_1(params, 1)),
                 'T' => self.screen.sd(canonicalize_params_1(params, 1)),
                 'X' => self.screen.ech(canonicalize_params_1(params, 1)),
+                'Z' => self.screen.cbt(canonicalize_params_1(params, 1)),
+                '`' => self.screen.hpa(canonicalize_params_1(params, 1)),
+                'b' => self.screen.rep(canonicalize_params_1(params, 1)),
                 'd' => self.screen.vpa(canonicalize_params_1(params, 1)),
                 'm' => self.screen.sgr(params, unhandled),
                 'r' => self.screen.decstbm(canonicalize_params_decstbm(
@@ -198,6 +217,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+        self.screen.clear_last_char();
         match params {
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);

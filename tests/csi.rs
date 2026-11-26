@@ -244,3 +244,251 @@ fn vpr_hpr_are_ignored_as_in_tmux() {
         }
     }
 }
+
+// CBT (CSI Ps Z, ECMA-48 8.3.7) moves the cursor back Ps 8-column tab stops
+// on the same row, clamping at column 0. After a character in the last column
+// (pending wrap), tmux 3.6a ends the pending wrap first — placing the cursor
+// on the last column (cols - 1) — and then steps back from there.
+#[test]
+fn cbt_moves_back_by_tab_stops_and_ends_pending_wrap() {
+    for (name, cols, input, expected_row, expected_cursor) in [
+        (
+            "default count from col 10",
+            20,
+            "\x1b[1;11H\x1b[ZX",
+            "        X",
+            (0, 9),
+        ),
+        (
+            "zero count defaults to 1",
+            20,
+            "\x1b[1;11H\x1b[0ZX",
+            "        X",
+            (0, 9),
+        ),
+        (
+            "from tab stop 8 goes to 0",
+            20,
+            "\x1b[1;9H\x1b[ZX",
+            "X",
+            (0, 1),
+        ),
+        ("from col 7 goes to 0", 20, "\x1b[1;8H\x1b[ZX", "X", (0, 1)),
+        ("from col 0 stays at 0", 20, "\x1b[1;1H\x1b[ZX", "X", (0, 1)),
+        (
+            "multiple stops from col 17",
+            20,
+            "\x1b[1;18H\x1b[2ZX",
+            "        X",
+            (0, 9),
+        ),
+        (
+            "clamps at col 0 for huge count",
+            20,
+            "\x1b[1;18H\x1b[999ZX",
+            "X",
+            (0, 1),
+        ),
+        (
+            "pending wrap at cols=20 ends at 19 then moves to 16",
+            20,
+            "aaaaaaaaaaaaaaaaaaaa\x1b[ZX",
+            "aaaaaaaaaaaaaaaaXaaa",
+            (0, 17),
+        ),
+        (
+            "pending wrap at cols=24 ends at 23 then moves to 16",
+            24,
+            "aaaaaaaaaaaaaaaaaaaaaaaa\x1b[ZX",
+            "aaaaaaaaaaaaaaaaXaaaaaaa",
+            (0, 17),
+        ),
+        (
+            "pending wrap at cols=25 ends at 24 then moves to 16",
+            25,
+            "aaaaaaaaaaaaaaaaaaaaaaaaa\x1b[ZX",
+            "aaaaaaaaaaaaaaaaXaaaaaaaa",
+            (0, 17),
+        ),
+    ] {
+        let mut parser = vt100::Parser::new(4, cols, 0);
+        parser.process(input.as_bytes());
+        assert_eq!(row_text(&parser, 0), expected_row, "{name}: row 0");
+        assert_eq!(
+            parser.screen().cursor_position(),
+            expected_cursor,
+            "{name}: cursor"
+        );
+    }
+
+    helpers::assert_reproduces_state(b"\x1b[1;20Hhello\x1b[2Zworld");
+}
+
+// HPA (CSI Ps `, ECMA-48 8.3.57) sets the 1-based column on the current row,
+// matching CHA (CSI Ps G) and tmux 3.6a.
+#[test]
+fn hpa_moves_to_absolute_column_and_ends_pending_wrap() {
+    for (name, input, expected_row, expected_cursor) in [
+        ("explicit column", "abcdef\x1b[4`X", "abcXef", (0, 4)),
+        ("default column is 1", "abcde\x1b[`X", "Xbcde", (0, 1)),
+        ("zero defaults to 1", "abcde\x1b[0`X", "Xbcde", (0, 1)),
+        (
+            "clamps to last column",
+            "abcde\x1b[999`X",
+            "abcde              X",
+            (0, 20),
+        ),
+        (
+            "ends pending wrap on last column",
+            "aaaaaaaaaaaaaaaaaaaa\x1b[20`X",
+            "aaaaaaaaaaaaaaaaaaaX",
+            (0, 20),
+        ),
+    ] {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(input.as_bytes());
+        assert_eq!(row_text(&parser, 0), expected_row, "{name}: row 0");
+        assert_eq!(
+            parser.screen().cursor_position(),
+            expected_cursor,
+            "{name}: cursor"
+        );
+    }
+
+    helpers::assert_reproduces_state(b"\x1b[2;1Hhello\x1b[3`world");
+}
+
+// REP (CSI Ps b, ECMA-48 8.3.103) repeats the immediately preceding printed
+// graphic character Ps times (default 1), capped by remaining columns on the
+// row (cols - pos.col) as tmux 3.6a does, and clears the remembered character
+// after repeating or on any intervening non-print control/escape/CSI/OSC.
+#[test]
+fn rep_repeats_preceding_graphic_char_as_in_tmux() {
+    for (name, input, expected_rows, expected_cursor) in [
+        ("basic repeat", "a\x1b[4bX", vec!["aaaaaX"], (0, 6)),
+        ("default count is 1", "a\x1b[bX", vec!["aaX"], (0, 3)),
+        ("zero defaults to 1", "a\x1b[0bX", vec!["aaX"], (0, 3)),
+        (
+            "no preceding char is a no-op",
+            "\x1b[4bX",
+            vec!["X"],
+            (0, 1),
+        ),
+        (
+            "consecutive REP clears last char",
+            "a\x1b[2b\x1b[2bX",
+            vec!["aaaX"],
+            (0, 4),
+        ),
+        ("cleared by SGR", "a\x1b[31m\x1b[3bX", vec!["aX"], (0, 2)),
+        (
+            "cleared by cursor motion CSI",
+            "a\x1b[2C\x1b[3bX",
+            vec!["a  X"],
+            (0, 4),
+        ),
+        (
+            "cleared by DECSET",
+            "a\x1b[?2026h\x1b[2bX",
+            vec!["aX"],
+            (0, 2),
+        ),
+        (
+            "cleared by C0 controls",
+            "a\r\n\x1b[3bX",
+            vec!["a", "X"],
+            (1, 1),
+        ),
+        ("cleared by BEL", "a\x07\x1b[2bX", vec!["aX"], (0, 2)),
+        ("cleared by ESC", "a\x1b7\x1b[2bX", vec!["aX"], (0, 2)),
+        (
+            "cleared by OSC",
+            "a\x1b]8;;https://example.com\x07\x1b[2bX",
+            vec!["aX"],
+            (0, 2),
+        ),
+        (
+            "cleared by DCS",
+            "a\x1bPfoo\x1b\\\x1b[2bX",
+            vec!["aX"],
+            (0, 2),
+        ),
+        (
+            "clamped to remaining columns on row",
+            "a\x1b[9999bX",
+            vec!["aaaaaaaaaaaaaaaaaaaa", "X"],
+            (1, 1),
+        ),
+        (
+            "clamped near right margin",
+            "\x1b[1;18Ha\x1b[5bX",
+            vec!["                 aaa", "X"],
+            (1, 1),
+        ),
+        (
+            "zero repeats when already pending wrap",
+            "aaaaaaaaaaaaaaaaaaaa\x1b[3bX",
+            vec!["aaaaaaaaaaaaaaaaaaaa", "X"],
+            (1, 1),
+        ),
+        (
+            "repeats wide character",
+            "a\u{4e2d}\x1b[2bX",
+            vec!["a\u{4e2d}\u{4e2d}\u{4e2d}X"],
+            (0, 8),
+        ),
+        (
+            "wide char count clamped by cols - pos.col as in tmux",
+            "\x1b[1;18H\u{4e2d}\x1b[10bX",
+            vec!["                 \u{4e2d}", "\u{4e2d}X"],
+            (1, 3),
+        ),
+        (
+            "wide char from col 15 clamped to 4 repeats as in tmux",
+            "\x1b[1;15H\u{4e2d}\x1b[10bX",
+            vec![
+                "              \u{4e2d}\u{4e2d}\u{4e2d}",
+                "\u{4e2d}\u{4e2d}X",
+            ],
+            (1, 5),
+        ),
+        (
+            "wide char pending wrap gives 0 repeats",
+            "\x1b[1;19H\u{4e2d}\x1b[10bX",
+            vec!["                  \u{4e2d}", "X"],
+            (1, 1),
+        ),
+        (
+            "repeats combining character",
+            "e\u{0301}\x1b[2bX",
+            vec!["e\u{0301}\u{0301}\u{0301}X"],
+            (0, 2),
+        ),
+    ] {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(input.as_bytes());
+        let got_rows: Vec<String> = parser
+            .screen()
+            .rows(0, 20)
+            .take(expected_rows.len())
+            .collect();
+        assert_eq!(got_rows, expected_rows, "{name}: rows");
+        assert_eq!(
+            parser.screen().cursor_position(),
+            expected_cursor,
+            "{name}: cursor"
+        );
+    }
+
+    helpers::assert_reproduces_state(b" \x1b[6bhello -\x1b[4b world");
+}
+
+// tmux 3.6a ignores CHT (CSI Ps I) and leaves the cursor and pending wrap
+// unchanged; pin that behavior alongside VPR/HPR.
+#[test]
+fn cht_is_ignored_as_in_tmux() {
+    let mut parser = vt100::Parser::new(4, 20, 0);
+    parser.process(b"abc\x1b[2IX");
+    assert_eq!(row_text(&parser, 0), "abcX");
+    assert_eq!(parser.screen().cursor_position(), (0, 4));
+}

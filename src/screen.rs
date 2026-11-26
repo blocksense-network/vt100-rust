@@ -63,6 +63,8 @@ pub struct Screen {
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
+
+    last_char: Option<char>,
 }
 
 impl Screen {
@@ -82,6 +84,8 @@ impl Screen {
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
+
+            last_char: None,
         }
     }
 
@@ -757,6 +761,10 @@ impl Screen {
 }
 
 impl Screen {
+    pub(crate) fn clear_last_char(&mut self) {
+        self.last_char = None;
+    }
+
     pub(crate) fn text(&mut self, c: char) {
         let pos = self.grid().pos();
         let size = self.grid().size();
@@ -765,8 +773,10 @@ impl Screen {
         let width = c.width();
         if width.is_none() && (u32::from(c)) < 256 {
             // don't even try to draw control characters
+            self.last_char = None;
             return;
         }
+        self.last_char = Some(c);
         let width = width
             .unwrap_or(1)
             .try_into()
@@ -1350,6 +1360,44 @@ impl Screen {
     pub(crate) fn ech(&mut self, count: u16) {
         let attrs = self.attrs;
         self.grid_mut().erase_cells(count, attrs);
+    }
+
+    // CSI Z (CBT, ECMA-48 8.3.7)
+    //
+    // Move back `count` 8-column tab stops on the current row, stopping at
+    // column 0. After a character in the last column (pending wrap), tmux
+    // ends the pending wrap first (clamping to the last column) and steps
+    // back from there.
+    pub(crate) fn cbt(&mut self, count: u16) {
+        self.end_pending_wrap();
+        self.grid_mut().col_back_tab(count);
+    }
+
+    // CSI ` (HPA, ECMA-48 8.3.57)
+    pub(crate) fn hpa(&mut self, col: u16) {
+        self.cha(col);
+    }
+
+    // CSI b (REP, ECMA-48 8.3.103)
+    //
+    // Repeat the immediately preceding printed graphic character `count`
+    // times, capped at the columns remaining on the current row
+    // (`cols - pos.col`) as tmux 3.6a does (preventing unbounded work on
+    // large parameters and matching tmux when a wide character wraps).
+    // Repeating consumes the remembered character so a second REP is a no-op.
+    pub(crate) fn rep(&mut self, count: u16) {
+        let Some(c) = self.last_char.take() else {
+            return;
+        };
+        let remaining = self
+            .grid()
+            .size()
+            .cols
+            .saturating_sub(self.grid().pos().col);
+        for _ in 0..count.min(remaining) {
+            self.text(c);
+        }
+        self.last_char = None;
     }
 
     // CSI d

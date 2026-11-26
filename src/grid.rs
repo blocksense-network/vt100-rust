@@ -786,6 +786,16 @@ impl Grid {
         self.col_clamp();
     }
 
+    pub fn col_back_tab(&mut self, count: u16) {
+        for _ in 0..count {
+            if self.pos.col == 0 {
+                break;
+            }
+            self.pos.col -= 1;
+            self.pos.col -= self.pos.col % 8;
+        }
+    }
+
     pub fn col_set(&mut self, i: u16) {
         self.pos.col = i;
         self.col_clamp();
